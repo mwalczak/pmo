@@ -1,0 +1,142 @@
+# Applied by .github/workflows/deploy.yml. The `pmo` secret (DB password, admins, SMTP) is created by the workflow
+# from repository secrets.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pmo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: pmo
+spec:
+  selector: { app: postgres }
+  ports:
+    - port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: pmo
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          env:
+            - { name: POSTGRES_USER, value: pmo }
+            - { name: POSTGRES_DB, value: pmo }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: pmo, key: POSTGRES_PASSWORD } }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec: { command: [pg_isready, -U, pmo] }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits: { memory: 256Mi }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: { storage: 2Gi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: pmo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: api }
+  template:
+    metadata:
+      labels: { app: api }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: api
+          image: IMAGE_PLACEHOLDER
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: pmo, key: POSTGRES_PASSWORD } }
+            - { name: DATABASE_URL, value: "postgres://pmo:$(POSTGRES_PASSWORD)@postgres:5432/pmo" }
+            - { name: PUBLIC_URL, value: "https://HOST_PLACEHOLDER" }
+            - name: ADMIN_EMAILS
+              valueFrom: { secretKeyRef: { name: pmo, key: ADMIN_EMAILS } }
+            # E-mail (new users' keys, status changes). An empty SMTP_PASSWORD turns sending off.
+            - name: SMTP_HOST
+              valueFrom: { secretKeyRef: { name: pmo, key: SMTP_HOST } }
+            - name: SMTP_USERNAME
+              valueFrom: { secretKeyRef: { name: pmo, key: SMTP_USERNAME } }
+            - name: SMTP_PASSWORD
+              valueFrom: { secretKeyRef: { name: pmo, key: SMTP_PASSWORD } }
+            # Empty: PMO <SMTP_USERNAME>.
+            - name: MAIL_FROM
+              valueFrom: { secretKeyRef: { name: pmo, key: MAIL_FROM } }
+            # Unique per workflow run, so re-running the deploy after changing secrets restarts the pod.
+            - { name: DEPLOY_ID, value: DEPLOY_ID_PLACEHOLDER }
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: pmo
+spec:
+  selector: { app: api }
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api
+  namespace: pmo
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: [HOST_PLACEHOLDER]
+      secretName: api-tls
+  rules:
+    - host: HOST_PLACEHOLDER
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80

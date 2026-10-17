@@ -1,0 +1,15 @@
+# Local development: Postgres, and Mailpit to read e-mails at http://localhost:8025.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: pmo
+      POSTGRES_PASSWORD: pmo
+      POSTGRES_DB: pmo
+    ports: ['5432:5432']
+    volumes: [pgdata:/var/lib/postgresql/data]
+  mailpit:
+    image: axllent/mailpit:v1.27
+    ports: ['1025:1025', '8025:8025']
+volumes:
+  pgdata:
