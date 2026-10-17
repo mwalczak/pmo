@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: pmo
+          POSTGRES_PASSWORD: pmo
+          POSTGRES_DB: pmo
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U pmo" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      # sqlx::test creates a fresh database per test through this connection.
+      DATABASE_URL: postgres://pmo:pmo@localhost:5432/pmo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - name: OpenAPI document builds and is valid
+        run: |
+          cargo run --locked -- openapi > openapi.json
+          npx --yes @redocly/cli@2.0.8 lint openapi.json
