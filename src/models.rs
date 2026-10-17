@@ -20,6 +20,21 @@ pub enum IssueType {
     Idea,
     /// Abuse reports are private: only admins and the reporter see them.
     Abuse,
+    /// Something to do: not a bug, not an idea.
+    Todo,
+}
+
+impl IssueType {
+    pub const ALL: [Self; 4] = [Self::Bug, Self::Idea, Self::Abuse, Self::Todo];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bug => "bug",
+            Self::Idea => "idea",
+            Self::Abuse => "abuse",
+            Self::Todo => "todo",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, sqlx::Type, ToSchema)]
@@ -83,4 +98,12 @@ where
 /// Trims a string, turning blank into `None`.
 pub fn non_blank(s: Option<String>) -> Option<String> {
     s.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
+}
+
+/// Validates and normalizes a platform name: 1-20 lowercase letters, digits or dashes, e.g. `web`, `android`.
+pub fn platform_name(name: &str) -> Option<String> {
+    let name = name.trim().to_lowercase();
+    let valid = (1..=20).contains(&name.len())
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    valid.then_some(name)
 }

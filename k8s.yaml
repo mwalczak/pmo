@@ -55,6 +55,17 @@ spec:
         resources:
           requests: { storage: 2Gi }
 ---
+# Attachment files (screenshots, recordings), named by their SHA-256.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: attachments
+  namespace: pmo
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 10Gi }
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -62,6 +73,9 @@ metadata:
   namespace: pmo
 spec:
   replicas: 1
+  # The attachments volume is ReadWriteOnce: stop the old pod before starting the new one.
+  # rollingUpdate: null clears the default left from the earlier RollingUpdate strategy, which apply would keep.
+  strategy: { type: Recreate, rollingUpdate: null }
   selector:
     matchLabels: { app: api }
   template:
@@ -70,6 +84,10 @@ spec:
     spec:
       securityContext:
         runAsNonRoot: true
+        fsGroup: 65532 # the image's non-root user
+      volumes:
+        - name: attachments
+          persistentVolumeClaim: { claimName: attachments }
       containers:
         - name: api
           image: IMAGE_PLACEHOLDER
@@ -90,8 +108,11 @@ spec:
             # Empty: PMO <SMTP_USERNAME>.
             - name: MAIL_FROM
               valueFrom: { secretKeyRef: { name: pmo, key: MAIL_FROM } }
+            - { name: STORAGE_DIR, value: /data/attachments }
             # Unique per workflow run, so re-running the deploy after changing secrets restarts the pod.
             - { name: DEPLOY_ID, value: DEPLOY_ID_PLACEHOLDER }
+          volumeMounts:
+            - { name: attachments, mountPath: /data/attachments }
           ports:
             - containerPort: 8080
           readinessProbe:

@@ -10,6 +10,7 @@ use crate::{
     AppState,
     auth::{self, ApiKey, KeyOwner, NewApiKey, Principal},
     error::{ApiError, ApiResult, ErrorBody},
+    events::{Diff, Event},
     extract::{Json, Path},
     models::non_blank,
 };
@@ -100,8 +101,12 @@ pub async fn create(
     let mut tx = state.db.begin().await?;
     sqlx::query("INSERT INTO apps (id, name) VALUES ($1, $2)").bind(id).bind(name).execute(&mut *tx).await?;
     set_projects(&mut tx, id, &body.projects).await?;
-    let key = auth::create_key(&mut *tx, KeyOwner::App(id), None).await?;
     let app = load(&mut tx, id).await?;
+    Event::new("app.created", "app", id)
+        .changes(serde_json::json!({ "name": app.name, "projects": app.projects }))
+        .record(&mut *tx, (&principal).into())
+        .await?;
+    let key = auth::create_key(&mut tx, KeyOwner::App(id), None, (&principal).into()).await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(CreatedApp { app, key })))
 }
@@ -136,7 +141,7 @@ pub async fn update(
 ) -> ApiResult<Json<App>> {
     principal.require_admin()?;
     let mut tx = state.db.begin().await?;
-    load(&mut tx, id).await?;
+    let current = load(&mut tx, id).await?;
     if let Some(name) = body.name {
         let name = non_blank(Some(name)).ok_or_else(|| ApiError::bad_request("name cannot be blank"))?;
         sqlx::query("UPDATE apps SET name = $2 WHERE id = $1").bind(id).bind(name).execute(&mut *tx).await?;
@@ -146,6 +151,11 @@ pub async fn update(
     }
     sqlx::query("UPDATE apps SET updated_at = now() WHERE id = $1").bind(id).execute(&mut *tx).await?;
     let app = load(&mut tx, id).await?;
+    let diff =
+        Diff::default().field("name", &current.name, &app.name).field("projects", &current.projects, &app.projects);
+    if !diff.is_empty() {
+        Event::new("app.updated", "app", id).changes(diff.into_value()).record(&mut *tx, (&principal).into()).await?;
+    }
     tx.commit().await?;
     Ok(Json(app))
 }
@@ -163,10 +173,14 @@ pub async fn delete(
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
     principal.require_admin()?;
-    let deleted = sqlx::query("DELETE FROM apps WHERE id = $1").bind(id).execute(&state.db).await?.rows_affected();
-    if deleted == 0 {
-        return Err(ApiError::not_found("app"));
-    }
+    let mut tx = state.db.begin().await?;
+    let app = load(&mut tx, id).await?;
+    sqlx::query("DELETE FROM apps WHERE id = $1").bind(id).execute(&mut *tx).await?;
+    Event::new("app.deleted", "app", id)
+        .changes(serde_json::json!({ "name": app.name, "projects": app.projects }))
+        .record(&mut *tx, (&principal).into())
+        .await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -200,6 +214,12 @@ pub async fn create_key(
 ) -> ApiResult<(StatusCode, Json<NewApiKey>)> {
     principal.require_admin()?;
     load(&mut *state.db.acquire().await?, id).await?;
-    let key = auth::create_key(&state.db, KeyOwner::App(id), non_blank(body.name).as_deref()).await?;
+    let key = auth::create_key(
+        &mut *state.db.acquire().await?,
+        KeyOwner::App(id),
+        non_blank(body.name).as_deref(),
+        (&principal).into(),
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(key)))
 }

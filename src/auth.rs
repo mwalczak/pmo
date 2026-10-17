@@ -5,13 +5,14 @@ use axum::{extract::FromRequestParts, http::request::Parts};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::PgExecutor;
+use sqlx::{PgConnection, PgExecutor};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
     AppState,
     error::{ApiError, ApiResult},
+    events::{Actor, Event},
     models::Role,
 };
 
@@ -46,7 +47,13 @@ pub fn hash_key(key: &str) -> Vec<u8> {
     Sha256::digest(key.as_bytes()).to_vec()
 }
 
-pub async fn create_key(db: impl PgExecutor<'_>, owner: KeyOwner, name: Option<&str>) -> sqlx::Result<NewApiKey> {
+/// Creates a key and logs it (never the key itself, only its prefix).
+pub async fn create_key(
+    db: &mut PgConnection,
+    owner: KeyOwner,
+    name: Option<&str>,
+    actor: Actor,
+) -> sqlx::Result<NewApiKey> {
     let (kind, user_id, app_id) = match owner {
         KeyOwner::User(id) => ("u", Some(id), None),
         KeyOwner::App(id) => ("a", None, Some(id)),
@@ -62,8 +69,16 @@ pub async fn create_key(db: impl PgExecutor<'_>, owner: KeyOwner, name: Option<&
     .bind(name)
     .bind(&key[..12])
     .bind(hash_key(&key))
-    .fetch_one(db)
+    .fetch_one(&mut *db)
     .await?;
+    let owner_field = match owner {
+        KeyOwner::User(id) => serde_json::json!({ "user_id": id }),
+        KeyOwner::App(id) => serde_json::json!({ "app_id": id }),
+    };
+    let mut changes = owner_field;
+    changes["prefix"] = info.prefix.clone().into();
+    changes["name"] = info.name.clone().into();
+    Event::new("key.created", "key", info.id).changes(changes).record(&mut *db, actor).await?;
     Ok(NewApiKey { key, info })
 }
 

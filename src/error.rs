@@ -16,13 +16,16 @@ pub enum ApiError {
     Forbidden(String),
     NotFound(String),
     Conflict(String),
+    PayloadTooLarge(String),
+    UnsupportedMediaType(String),
     Internal(anyhow::Error),
 }
 
 /// Every error response has this shape.
 #[derive(Serialize, ToSchema)]
 pub struct ErrorBody {
-    /// Machine-readable code: `bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict` or `internal`.
+    /// Machine-readable code: `bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`, `too_large`,
+    /// `unsupported_type` or `internal`.
     pub error: &'static str,
     pub message: String,
 }
@@ -54,6 +57,8 @@ impl IntoResponse for ApiError {
             Self::Forbidden(m) => (StatusCode::FORBIDDEN, "forbidden", m),
             Self::NotFound(m) => (StatusCode::NOT_FOUND, "not_found", m),
             Self::Conflict(m) => (StatusCode::CONFLICT, "conflict", m),
+            Self::PayloadTooLarge(m) => (StatusCode::PAYLOAD_TOO_LARGE, "too_large", m),
+            Self::UnsupportedMediaType(m) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_type", m),
             Self::Internal(e) => {
                 tracing::error!(error = ?e, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error".to_owned())

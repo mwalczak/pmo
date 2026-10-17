@@ -5,7 +5,9 @@ and AI agents. There is no frontend. Apps build their own thin clients, and agen
 
 Rust · Axum · SQLx · Postgres 17 (`pg_trgm` for typo-tolerant search) · a 15 MB distroless image · ~10 MB RAM.
 
-- **API docs:** `https://<API_HOST>/docs` · **OpenAPI:** `https://<API_HOST>/openapi.json`
+- **API docs:** `https://<API_HOST>/` (→ `/docs`) · **OpenAPI:** `https://<API_HOST>/openapi.json`
+- **For agents building an app's report page:** the [`pmo-thin-client` skill](.claude/skills/pmo-thin-client/SKILL.md),
+  also served at `https://<API_HOST>/skills/pmo-thin-client/SKILL.md`
 - **First client:** [dobre-mleko.app](https://dobre-mleko.app): a report form plus a list of open issues, so users can
   check what is already reported before filing a duplicate.
 
@@ -16,9 +18,11 @@ Rust · Axum · SQLx · Postgres 17 (`pg_trgm` for typo-tolerant search) · a 15
 | **Users** | `admin` (manages everything, triages issues) or `reporter` (reports issues, edits the text of their own). |
 | **Apps** | Client apps such as `dobre-mleko.app`. They call PMO **server-to-server** with an app key and only reach their own projects. |
 | **Keys** | `Authorization: Bearer <key>`. User keys are `pmo_u_…`, app keys `pmo_a_…`. Only their SHA-256 is stored. Anyone can create more keys and revoke their own. |
-| **Projects** | Have a short key (`DM`) that prefixes issue keys (`DM-12`). |
+| **Projects** | Have a short key (`DM`) that prefixes issue keys (`DM-12`), and say what apps offer in their report forms: `platforms` and `issue_types`, each `[{id, label}]` (labels in the project's language). Reporters can only choose the project's issue types; admins can use any. |
 | **Milestones** | Belong to a project; `open`/`closed`, optional due date. |
-| **Issues** | `type` bug/idea/abuse · `priority` P1–P5 (default P3, set by admins) · `status` reported → accepted → in_progress → done / wont_fix / duplicate (with `duplicate_of`). |
+| **Issues** | `type` bug/idea/abuse/todo · `priority` P1–P5 (default P3, set by admins) · `status` reported → accepted → in_progress → done / wont_fix / duplicate (with `duplicate_of`) · `platform`, one of the project's. |
+| **Attachments** | Screenshots and recordings on issues: images (PNG, JPEG, GIF, WebP, HEIC, AVIF) and videos (MP4, MOV, WebM), the type detected from the contents, up to `MAX_UPLOAD_MB` each and 20 per issue. Stored on a volume under their SHA-256. Visible to whoever sees the issue; downloads support `Range`. |
+| **Action log** | Every change is logged: who (user, app or `system`), what (`issue.updated`, `attachment.added`, `key.revoked`, …), when, and the changed fields as `{"from", "to"}`. It outlives what it describes. |
 
 **Reporters are created on the fly.** When an app reports an issue for an e-mail that has no account yet
 (`"reporter": {"email": …, "name": …}`), PMO creates a reporter and e-mails them a personal key. They can use that
@@ -37,10 +41,12 @@ only to admins and the reporter themselves.
 | `GET/POST /v1/projects` · `GET/PATCH /v1/projects/{key}` | Projects (writes: admin) |
 | `GET/POST /v1/projects/{key}/milestones` · `GET/PATCH/DELETE /v1/milestones/{id}` | Milestones (writes: admin) |
 | `GET/POST /v1/projects/{key}/issues` · `GET/PATCH/DELETE /v1/issues/{key}` | Issues |
+| `GET/POST /v1/issues/{key}/attachments` · `GET/DELETE /v1/attachments/{id}` | Attachments (upload: multipart `file`) |
+| `GET /v1/issues/{key}/events` · `GET /v1/events` | An issue's history; the whole log (admin, filterable by project, issue, action, actor, time) |
 | `/v1/users…` · `/v1/apps…` | Admin only: users, apps and their keys |
 
-Listing issues takes `status` (comma-separated, or `open` / `closed`), `type`, `priority`, `milestone_id`,
-`reporter_id`, `q` (search, sorted by relevance), `sort` (`newest`, `oldest`, `priority`, `updated`), `limit` and
+Listing issues takes `status` (comma-separated, or `open` / `closed`), `type`, `priority`, `platform`,
+`milestone_id`, `reporter_id`, `q` (search, sorted by relevance), `sort` (`newest`, `oldest`, `priority`, `updated`), `limit` and
 `offset`. Errors are always `{"error": "not_found", "message": "…"}`.
 
 ## Quick start
@@ -89,6 +95,8 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` | E-mail server. Port `465` (default) uses TLS, other ports STARTTLS. |
 | `SMTP_URL` | Alternative to the above, e.g. `smtp://localhost:1025` for Mailpit |
 | `MAIL_FROM` | Default `PMO <SMTP_USERNAME>` |
+| `STORAGE_DIR` | Attachment files, default `./data/attachments` (a volume in production) |
+| `MAX_UPLOAD_MB` | Largest attachment, default `100` |
 
 Without SMTP, e-mails are only logged; their bodies (which can contain keys) appear only at `RUST_LOG=debug`.
 
@@ -104,7 +112,9 @@ Without SMTP, e-mails are only logged; their bodies (which can contain keys) app
 ## Deployment
 
 Pushes to `main` run CI. When CI passes, **Build and deploy** pushes the image to GHCR and applies `k8s.yaml` to k3s
-over SSH (namespace `pmo`: Postgres StatefulSet, API Deployment, Traefik Ingress with a cert-manager certificate).
+over SSH (namespace `pmo`: Postgres StatefulSet, API Deployment with a 10 Gi attachments volume, Traefik Ingress
+with a cert-manager certificate). The attachments volume is ReadWriteOnce, so deploys use the `Recreate` strategy:
+a few seconds of downtime. Back up both the Postgres volume and the attachments volume.
 
 Repository settings → Secrets and variables → Actions:
 

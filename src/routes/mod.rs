@@ -1,4 +1,6 @@
 mod apps;
+mod attachments;
+mod events;
 mod issues;
 mod me;
 mod milestones;
@@ -30,7 +32,8 @@ use crate::AppState;
 Authenticate every `/v1` request with `Authorization: Bearer <key>`. User keys (`pmo_u_…`) act as that user; \
 app keys (`pmo_a_…`) are for server-to-server calls and only reach the app's projects.\n\n\
 When an app reports an issue for an e-mail that has no account yet, PMO creates a reporter account and e-mails \
-them a personal key.",
+them a personal key.\n\n\
+Building an app's report page? Agents: read `/skills/pmo-thin-client/SKILL.md`.",
     ),
     modifiers(&BearerAuth),
     security(("api_key" = [])),
@@ -38,7 +41,9 @@ them a personal key.",
         (name = "me", description = "The caller and their keys"),
         (name = "projects", description = "Projects group milestones and issues; their key prefixes issue keys"),
         (name = "milestones", description = "Planned releases or goals within a project"),
-        (name = "issues", description = "Bugs, ideas and abuse reports"),
+        (name = "issues", description = "Bugs, ideas, abuse reports and things to do"),
+        (name = "attachments", description = "Screenshots and recordings on issues"),
+        (name = "events", description = "The action log: who did what, when, and what changed"),
         (name = "users", description = "Admin only"),
         (name = "apps", description = "Client apps and their keys. Admin only"),
     )
@@ -67,6 +72,15 @@ fn api_router() -> OpenApiRouter<AppState> {
         .routes(routes!(milestones::get, milestones::update, milestones::delete))
         .routes(routes!(issues::list, issues::create))
         .routes(routes!(issues::get, issues::update, issues::delete))
+        .routes(routes!(events::for_issue))
+        .routes(routes!(events::list))
+        // Uploads stream to disk and Storage enforces MAX_UPLOAD_MB; other bodies keep axum's 2 MB limit.
+        .merge(
+            OpenApiRouter::new()
+                .routes(routes!(attachments::list, attachments::add))
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .routes(routes!(attachments::download, attachments::delete))
         .routes(routes!(users::list, users::create))
         .routes(routes!(users::get, users::update))
         .routes(routes!(users::list_keys, users::create_key))
@@ -107,7 +121,18 @@ pub fn app(state: AppState) -> Router {
     router
         .route("/healthz", get(|| async { "ok" }))
         .route("/openapi.json", get(move || async move { ([(header::CONTENT_TYPE, "application/json")], doc) }))
+        .route("/", get(|| async { axum::response::Redirect::to("/docs") }))
         .route("/docs", get(docs))
+        // How to build a thin client (an app's report page and backend proxy), for AI agents.
+        .route(
+            "/skills/pmo-thin-client/SKILL.md",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+                    include_str!("../../.claude/skills/pmo-thin-client/SKILL.md"),
+                )
+            }),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

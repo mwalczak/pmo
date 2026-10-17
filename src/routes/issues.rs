@@ -10,9 +10,10 @@ use crate::{
     AppState,
     auth::Principal,
     error::{ApiError, ApiResult, ErrorBody},
+    events::{Actor, Diff, Event},
     extract::{Json, Path, Query},
     mail::{Mail, welcome_mail},
-    models::{IssueStatus, IssueType, Priority, double_option, non_blank},
+    models::{IssueStatus, IssueType, Priority, double_option, non_blank, platform_name},
 };
 
 const MAX_TITLE: usize = 200;
@@ -35,6 +36,8 @@ pub struct Issue {
     pub description: Option<String>,
     /// Private issues are visible only to admins and their reporter.
     pub private: bool,
+    /// One of the project's platforms, e.g. `web`.
+    pub platform: Option<String>,
     pub reporter: Reporter,
     pub milestone: Option<MilestoneRef>,
     /// Key of the issue this one duplicates, when `status` is `duplicate`.
@@ -61,9 +64,9 @@ pub struct MilestoneRef {
 }
 
 #[derive(sqlx::FromRow)]
-struct IssueRow {
-    id: Uuid,
-    project_id: Uuid,
+pub(super) struct IssueRow {
+    pub(super) id: Uuid,
+    pub(super) project_id: Uuid,
     project: String,
     number: i32,
     issue_type: IssueType,
@@ -72,7 +75,9 @@ struct IssueRow {
     title: String,
     description: Option<String>,
     private: bool,
-    reporter_id: Uuid,
+    platform: Option<String>,
+    project_platforms: sqlx::types::Json<Vec<super::projects::Choice>>,
+    pub(super) reporter_id: Uuid,
     reporter_name: Option<String>,
     reporter_email: String,
     milestone_id: Option<Uuid>,
@@ -80,11 +85,16 @@ struct IssueRow {
     duplicate_of_id: Option<Uuid>,
     duplicate_of: Option<String>,
     source_app: Option<String>,
+    pub(super) source_app_id: Option<Uuid>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
 
 impl IssueRow {
+    pub(super) fn key(&self) -> String {
+        format!("{}-{}", self.project, self.number)
+    }
+
     fn into_issue(self, principal: &Principal) -> Issue {
         let sees_email = principal.is_admin() || principal.user().is_some_and(|u| u.id == self.reporter_id);
         Issue {
@@ -98,6 +108,7 @@ impl IssueRow {
             title: self.title,
             description: self.description,
             private: self.private,
+            platform: self.platform,
             reporter: Reporter {
                 id: self.reporter_id,
                 name: self.reporter_name,
@@ -113,9 +124,9 @@ impl IssueRow {
 }
 
 const SELECT: &str = "SELECT i.id, i.project_id, p.key AS project, i.number, i.type AS issue_type, i.priority,
-    i.status, i.title, i.description, i.private, i.reporter_id, u.name AS reporter_name, u.email AS reporter_email,
+    i.status, i.title, i.description, i.private, i.platform, p.platforms AS project_platforms, i.reporter_id, u.name AS reporter_name, u.email AS reporter_email,
     i.milestone_id, m.name AS milestone_name, i.duplicate_of_id, dp.key || '-' || d.number AS duplicate_of,
-    a.name AS source_app, i.created_at, i.updated_at
+    a.name AS source_app, i.source_app_id, i.created_at, i.updated_at
     FROM issues i
     JOIN projects p ON p.id = i.project_id
     JOIN users u ON u.id = i.reporter_id
@@ -144,12 +155,28 @@ fn parse_key(key: &str) -> ApiResult<(&str, i32)> {
         .ok_or_else(|| ApiError::bad_request(format!("invalid issue key {key:?}, expected e.g. DM-12")))
 }
 
+/// Loads an issue by id, as the caller may see it (as `load` does for keys).
+pub(super) async fn load_by_id(state: &AppState, principal: &Principal, id: Uuid) -> ApiResult<IssueRow> {
+    let issue: IssueRow = sqlx::query_as(sqlx::AssertSqlSafe(format!("{SELECT} WHERE i.id = $1")))
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| ApiError::not_found("issue"))?;
+    // Apps only reach their projects; private issues only admins and their reporter.
+    projects::load(state, principal, &issue.project).await?;
+    let sees = !issue.private || principal.is_admin() || principal.user().is_some_and(|u| u.id == issue.reporter_id);
+    if !sees {
+        return Err(ApiError::not_found("issue"));
+    }
+    Ok(issue)
+}
+
 async fn fetch_by_id(db: impl PgExecutor<'_>, id: Uuid) -> sqlx::Result<IssueRow> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!("{SELECT} WHERE i.id = $1"))).bind(id).fetch_one(db).await
 }
 
 /// Loads an issue by key, as the caller may see it.
-async fn load(state: &AppState, principal: &Principal, key: &str) -> ApiResult<IssueRow> {
+pub(super) async fn load(state: &AppState, principal: &Principal, key: &str) -> ApiResult<IssueRow> {
     let (project_key, number) = parse_key(key)?;
     let project = projects::load(state, principal, project_key).await?;
     let mut qb = QueryBuilder::new(SELECT);
@@ -182,6 +209,7 @@ pub struct ListIssues {
     pub priority: Option<String>,
     pub milestone_id: Option<Uuid>,
     pub reporter_id: Option<Uuid>,
+    pub platform: Option<String>,
     /// Search in titles and descriptions, tolerant of typos. Results are sorted by relevance unless `sort` is given.
     /// Use it to look for an existing report before filing a new one.
     pub q: Option<String>,
@@ -254,6 +282,9 @@ pub async fn list(
     if let Some(milestone_id) = query.milestone_id {
         qb.push(" AND i.milestone_id = ").push_bind(milestone_id);
     }
+    if let Some(platform) = &query.platform {
+        qb.push(" AND i.platform = ").push_bind(platform.trim().to_lowercase());
+    }
     if let Some(reporter_id) = query.reporter_id {
         qb.push(" AND i.reporter_id = ").push_bind(reporter_id);
     }
@@ -295,6 +326,7 @@ pub struct NewReporter {
 
 #[derive(Deserialize, ToSchema)]
 pub struct CreateIssue {
+    /// One of the project's `issue_types` (admins may use any type).
     #[serde(rename = "type")]
     pub issue_type: IssueType,
     pub title: String,
@@ -305,9 +337,25 @@ pub struct CreateIssue {
     pub milestone_id: Option<Uuid>,
     /// Default `false`; abuse reports are always created private.
     pub private: Option<bool>,
+    /// One of the project's platforms (their ids, see `platforms` in GET /v1/projects/{key}).
+    #[schema(example = "web")]
+    pub platform: Option<String>,
     /// Who reported the issue. Required for apps, optional for admins; users report as themselves.
     /// An e-mail without an account gets one, and a key is e-mailed to it.
     pub reporter: Option<NewReporter>,
+}
+
+/// Checks that the platform is one of the project's (by id).
+fn valid_platform(platform: Option<&str>, platforms: &[&str]) -> ApiResult<Option<String>> {
+    let Some(platform) = platform.filter(|p| !p.trim().is_empty()) else { return Ok(None) };
+    match platform_name(platform) {
+        Some(p) if platforms.contains(&p.as_str()) => Ok(Some(p)),
+        _ if platforms.is_empty() => Err(ApiError::bad_request("this project has no platforms configured")),
+        _ => Err(ApiError::bad_request(format!(
+            "unknown platform {platform:?}; this project has: {}",
+            platforms.join(", ")
+        ))),
+    }
 }
 
 fn valid_text(title: String, description: Option<String>) -> ApiResult<(String, Option<String>)> {
@@ -338,6 +386,14 @@ pub async fn create(
 ) -> ApiResult<(StatusCode, Json<Issue>)> {
     let project = projects::load(&state, &principal, &key).await?;
     let (title, description) = valid_text(body.title, body.description)?;
+    let platform = valid_platform(body.platform.as_deref(), &project.platform_ids())?;
+    if !principal.is_admin() && !project.offers_type(body.issue_type) {
+        return Err(ApiError::bad_request(format!(
+            "this project does not take {} reports; see issue_types in GET /v1/projects/{}",
+            body.issue_type.as_str(),
+            project.key
+        )));
+    }
     if !principal.is_admin() && (body.priority.is_some() || body.milestone_id.is_some()) {
         return Err(ApiError::forbidden("only admins can set priority and milestone"));
     }
@@ -359,7 +415,7 @@ pub async fn create(
             (u.id, None)
         }
         (_, Some(r)) => {
-            let (id, key) = users::find_or_create(&mut tx, &r.email, r.name.clone()).await?;
+            let (id, key) = users::find_or_create(&mut tx, &r.email, r.name.clone(), (&principal).into()).await?;
             (id, key.map(|k| (k.key, r.email, non_blank(r.name))))
         }
     };
@@ -371,8 +427,8 @@ pub async fn create(
     let id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO issues (id, project_id, number, type, priority, title, description, private, reporter_id,
-                             milestone_id, source_app_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                             milestone_id, source_app_id, platform)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(id)
     .bind(project.id)
@@ -385,8 +441,26 @@ pub async fn create(
     .bind(reporter_id)
     .bind(body.milestone_id)
     .bind(principal.app_id())
+    .bind(platform)
     .execute(&mut *tx)
     .await?;
+    let created = fetch_by_id(&mut *tx, id).await?;
+    Event::new("issue.created", "issue", id)
+        .project(project.id)
+        .issue(id, created.key())
+        .changes(serde_json::json!({
+            "type": created.issue_type,
+            "priority": created.priority,
+            "status": created.status,
+            "title": created.title,
+            "description": created.description,
+            "private": created.private,
+            "platform": created.platform,
+            "milestone_id": created.milestone_id,
+            "reporter": { "id": created.reporter_id, "name": created.reporter_name },
+        }))
+        .record(&mut *tx, (&principal).into())
+        .await?;
     tx.commit().await?;
 
     if let Some((key, email, name)) = new_key {
@@ -396,8 +470,7 @@ pub async fn create(
         };
         state.mailer.send(welcome_mail(state.public_url.as_deref(), &email, name.as_deref(), &key, via));
     }
-    let issue = fetch_by_id(&state.db, id).await?.into_issue(&principal);
-    Ok((StatusCode::CREATED, Json(issue)))
+    Ok((StatusCode::CREATED, Json(created.into_issue(&principal))))
 }
 
 /// Get an issue.
@@ -424,6 +497,10 @@ pub struct UpdateIssue {
     /// Setting `duplicate` requires `duplicate_of`; any other status clears it.
     pub status: Option<IssueStatus>,
     pub private: Option<bool>,
+    /// One of the project's platforms; `null` clears it.
+    #[serde(default, deserialize_with = "double_option")]
+    #[schema(value_type = Option<String>)]
+    pub platform: Option<Option<String>>,
     /// `null` removes the issue from its milestone.
     #[serde(default, deserialize_with = "double_option")]
     #[schema(value_type = Option<Uuid>)]
@@ -436,7 +513,7 @@ pub struct UpdateIssue {
 
 /// Update or triage an issue.
 ///
-/// Admins can change everything; reporters only the title and description of their own issues.
+/// Admins can change everything; reporters only the title, description and platform of their own issues.
 /// The reporter is e-mailed when the status changes.
 #[utoipa::path(
     patch, operation_id = "updateIssue", path = "/v1/issues/{key}", tag = "issues", params(("key" = String, Path)), request_body = UpdateIssue,
@@ -458,12 +535,21 @@ pub async fn update(
         || body.duplicate_of.is_some();
     if !principal.is_admin() && (!is_reporter || triage) {
         return Err(ApiError::forbidden(
-            "only admins can triage issues; reporters can edit the title and description of their own",
+            "only admins can triage issues; reporters can edit the title, description and platform of their own",
         ));
     }
 
-    let (title, description) =
-        valid_text(body.title.unwrap_or(current.title), body.description.map_or(current.description, Some))?;
+    let (title, description) = valid_text(
+        body.title.clone().unwrap_or_else(|| current.title.clone()),
+        body.description.clone().map_or_else(|| current.description.clone(), Some),
+    )?;
+    let platform = match &body.platform {
+        Some(p) => {
+            let ids: Vec<&str> = current.project_platforms.0.iter().map(|c| c.id.as_str()).collect();
+            valid_platform(p.as_deref(), &ids)?
+        }
+        None => current.platform.clone(),
+    };
     if let Some(Some(milestone_id)) = body.milestone_id {
         let milestone = milestones::load(&state, &principal, milestone_id).await?;
         if milestone.project_id != current.project_id {
@@ -500,9 +586,10 @@ pub async fn update(
         .private
         .unwrap_or(current.private || (issue_type == IssueType::Abuse && current.issue_type != IssueType::Abuse));
 
+    let mut tx = state.db.begin().await?;
     sqlx::query(
         "UPDATE issues SET title = $2, description = $3, type = $4, priority = $5, status = $6, private = $7,
-                milestone_id = $8, duplicate_of_id = $9, updated_at = now()
+                milestone_id = $8, duplicate_of_id = $9, platform = $10, updated_at = now()
          WHERE id = $1",
     )
     .bind(current.id)
@@ -514,10 +601,30 @@ pub async fn update(
     .bind(private)
     .bind(body.milestone_id.unwrap_or(current.milestone_id))
     .bind(duplicate_of_id)
-    .execute(&state.db)
+    .bind(platform)
+    .execute(&mut *tx)
     .await?;
 
-    let updated = fetch_by_id(&state.db, current.id).await?;
+    let updated = fetch_by_id(&mut *tx, current.id).await?;
+    let diff = Diff::default()
+        .field("title", &current.title, &updated.title)
+        .field("description", &current.description, &updated.description)
+        .field("type", &current.issue_type, &updated.issue_type)
+        .field("priority", &current.priority, &updated.priority)
+        .field("status", &current.status, &updated.status)
+        .field("private", &current.private, &updated.private)
+        .field("platform", &current.platform, &updated.platform)
+        .field("milestone_id", &current.milestone_id, &updated.milestone_id)
+        .field("duplicate_of", &current.duplicate_of, &updated.duplicate_of);
+    if !diff.is_empty() {
+        Event::new("issue.updated", "issue", current.id)
+            .project(current.project_id)
+            .issue(current.id, current.key())
+            .changes(diff.into_value())
+            .record(&mut *tx, (&principal).into())
+            .await?;
+    }
+    tx.commit().await?;
     if status != current.status && !is_reporter {
         state.mailer.send(status_mail(&updated));
     }
@@ -551,13 +658,33 @@ pub async fn delete(
     let issue = load(&state, &principal, &key).await?;
     let mut tx = state.db.begin().await?;
     // Issues marked as duplicates of this one go back to triage.
-    sqlx::query(
-        "UPDATE issues SET status = 'reported', duplicate_of_id = NULL, updated_at = now() WHERE duplicate_of_id = $1",
+    let reopened: Vec<(Uuid, i32)> = sqlx::query_as(
+        "UPDATE issues SET status = 'reported', duplicate_of_id = NULL, updated_at = now() WHERE duplicate_of_id = $1
+         RETURNING id, number",
     )
     .bind(issue.id)
-    .execute(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
+    for (id, number) in reopened {
+        Event::new("issue.updated", "issue", id)
+            .project(issue.project_id)
+            .issue(id, format!("{}-{number}", issue.project))
+            .changes(serde_json::json!({
+                "status": { "from": IssueStatus::Duplicate, "to": IssueStatus::Reported },
+                "duplicate_of": { "from": issue.key(), "to": null },
+            }))
+            .record(&mut *tx, Actor::from(&principal))
+            .await?;
+    }
+    let paths = super::attachments::delete_for_issue(&mut tx, issue.id).await?;
     sqlx::query("DELETE FROM issues WHERE id = $1").bind(issue.id).execute(&mut *tx).await?;
+    Event::new("issue.deleted", "issue", issue.id)
+        .project(issue.project_id)
+        .issue(issue.id, issue.key())
+        .changes(serde_json::json!({ "title": issue.title, "type": issue.issue_type, "status": issue.status }))
+        .record(&mut *tx, (&principal).into())
+        .await?;
     tx.commit().await?;
+    state.storage.remove_unused(&state.db, paths).await;
     Ok(StatusCode::NO_CONTENT)
 }

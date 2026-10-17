@@ -10,6 +10,10 @@ pub struct Config {
     pub admin_emails: Vec<String>,
     pub smtp: Option<Smtp>,
     pub mail_from: String,
+    /// Where attachment files are kept (a volume in production).
+    pub storage_dir: String,
+    /// Largest attachment, in bytes.
+    pub max_upload_bytes: u64,
 }
 
 impl Config {
@@ -22,6 +26,14 @@ impl Config {
                 .map(|v| v.split(',').map(|e| e.trim().to_owned()).filter(|e| !e.is_empty()).collect())
                 .unwrap_or_default(),
             smtp: Smtp::from_env()?,
+            storage_dir: var("STORAGE_DIR").unwrap_or_else(|| "./data/attachments".to_owned()),
+            max_upload_bytes: var("MAX_UPLOAD_MB")
+                .map(|v| v.parse::<u64>())
+                .transpose()
+                .context("MAX_UPLOAD_MB")?
+                .unwrap_or(100)
+                * 1024
+                * 1024,
             mail_from: var("MAIL_FROM")
                 .or_else(|| var("SMTP_USERNAME").map(|u| format!("PMO <{u}>")))
                 .unwrap_or_else(|| "PMO <pmo@localhost>".to_owned()),

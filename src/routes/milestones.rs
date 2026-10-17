@@ -9,6 +9,7 @@ use crate::{
     AppState,
     auth::Principal,
     error::{ApiError, ApiResult, ErrorBody},
+    events::{Diff, Event},
     extract::{Json, Path, Query},
     models::{MilestoneState, double_option, non_blank},
 };
@@ -95,14 +96,22 @@ pub async fn create(
     let project = projects::load(&state, &principal, &key).await?;
     let name = non_blank(Some(body.name)).ok_or_else(|| ApiError::bad_request("name is required"))?;
     let id = Uuid::now_v7();
+    let description = non_blank(body.description);
+    let mut tx = state.db.begin().await?;
     sqlx::query("INSERT INTO milestones (id, project_id, name, description, due_on) VALUES ($1, $2, $3, $4, $5)")
         .bind(id)
         .bind(project.id)
-        .bind(name)
-        .bind(non_blank(body.description))
+        .bind(&name)
+        .bind(&description)
         .bind(body.due_on)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+    Event::new("milestone.created", "milestone", id)
+        .project(project.id)
+        .changes(serde_json::json!({ "name": name, "description": description, "due_on": body.due_on }))
+        .record(&mut *tx, (&principal).into())
+        .await?;
+    tx.commit().await?;
     Ok((StatusCode::CREATED, Json(load(&state, &principal, id).await?)))
 }
 
@@ -146,18 +155,35 @@ pub async fn update(
     let current = load(&state, &principal, id).await?;
     let name = match body.name {
         Some(n) => non_blank(Some(n)).ok_or_else(|| ApiError::bad_request("name cannot be blank"))?,
-        None => current.name,
+        None => current.name.clone(),
     };
+    let description = body.description.map_or_else(|| current.description.clone(), |d| non_blank(Some(d)));
+    let due_on = body.due_on.unwrap_or(current.due_on);
+    let milestone_state = body.state.unwrap_or(current.state);
+    let mut tx = state.db.begin().await?;
     sqlx::query(
         "UPDATE milestones SET name = $2, description = $3, due_on = $4, state = $5, updated_at = now() WHERE id = $1",
     )
     .bind(id)
-    .bind(name)
-    .bind(body.description.map_or(current.description, |d| non_blank(Some(d))))
-    .bind(body.due_on.unwrap_or(current.due_on))
-    .bind(body.state.unwrap_or(current.state))
-    .execute(&state.db)
+    .bind(&name)
+    .bind(&description)
+    .bind(due_on)
+    .bind(milestone_state)
+    .execute(&mut *tx)
     .await?;
+    let diff = Diff::default()
+        .field("name", &current.name, &name)
+        .field("description", &current.description, &description)
+        .field("due_on", &current.due_on, &due_on)
+        .field("state", &current.state, &milestone_state);
+    if !diff.is_empty() {
+        Event::new("milestone.updated", "milestone", id)
+            .project(current.project_id)
+            .changes(diff.into_value())
+            .record(&mut *tx, (&principal).into())
+            .await?;
+    }
+    tx.commit().await?;
     Ok(Json(load(&state, &principal, id).await?))
 }
 
@@ -174,10 +200,14 @@ pub async fn delete(
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
     principal.require_admin()?;
-    let deleted =
-        sqlx::query("DELETE FROM milestones WHERE id = $1").bind(id).execute(&state.db).await?.rows_affected();
-    if deleted == 0 {
-        return Err(ApiError::not_found("milestone"));
-    }
+    let milestone = load(&state, &principal, id).await?;
+    let mut tx = state.db.begin().await?;
+    sqlx::query("DELETE FROM milestones WHERE id = $1").bind(id).execute(&mut *tx).await?;
+    Event::new("milestone.deleted", "milestone", id)
+        .project(milestone.project_id)
+        .changes(serde_json::json!({ "name": milestone.name }))
+        .record(&mut *tx, (&principal).into())
+        .await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }

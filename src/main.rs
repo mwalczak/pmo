@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use pmo::{AppState, auth, config::Config, mail::Mailer};
+use pmo::{AppState, auth, config::Config, events::Actor, mail::Mailer, storage::Storage};
 use sqlx::postgres::PgPoolOptions;
 use tracing_subscriber::EnvFilter;
 
@@ -43,11 +43,14 @@ async fn serve() -> Result<()> {
     let config = Config::from_env()?;
     let db = connect(&config).await?;
     pmo::MIGRATOR.run(&db).await?;
+    let storage = Storage::new(&config.storage_dir, config.max_upload_bytes);
+    storage.init().await.with_context(|| format!("STORAGE_DIR {} is not writable", config.storage_dir))?;
 
     let state = AppState {
         db,
         mailer: Arc::new(Mailer::from_config(config.smtp.as_ref(), &config.mail_from)?),
         public_url: config.public_url.clone(),
+        storage: Arc::new(storage),
     };
     pmo::ensure_admins(&state, &config.admin_emails).await?;
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port)).await?;
@@ -74,7 +77,13 @@ async fn create_key(email: &str, admin: bool) -> Result<()> {
     .bind(role)
     .fetch_one(&db)
     .await?;
-    let key = auth::create_key(&db, auth::KeyOwner::User(user_id), Some("created with pmo create-key")).await?;
+    let key = auth::create_key(
+        &mut *db.acquire().await?,
+        auth::KeyOwner::User(user_id),
+        Some("created with pmo create-key"),
+        Actor::System,
+    )
+    .await?;
     println!("{}", key.key);
     Ok(())
 }

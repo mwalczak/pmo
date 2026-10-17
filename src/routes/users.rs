@@ -10,6 +10,7 @@ use crate::{
     AppState,
     auth::{self, ApiKey, KeyOwner, NewApiKey, Principal},
     error::{ApiError, ApiResult, ErrorBody},
+    events::{Actor, Diff, Event},
     extract::{Json, Path, Query},
     mail::welcome_mail,
     models::{Role, non_blank},
@@ -38,6 +39,7 @@ pub async fn find_or_create(
     db: &mut PgConnection,
     email: &str,
     name: Option<String>,
+    actor: Actor,
 ) -> ApiResult<(Uuid, Option<NewApiKey>)> {
     let email = valid_email(email)?;
     let name = non_blank(name);
@@ -50,7 +52,11 @@ pub async fn find_or_create(
     .fetch_optional(&mut *db)
     .await?;
     if let Some(id) = created {
-        let key = auth::create_key(&mut *db, KeyOwner::User(id), Some("welcome e-mail")).await?;
+        Event::new("user.created", "user", id)
+            .changes(serde_json::json!({ "email": email, "name": name, "role": Role::Reporter }))
+            .record(&mut *db, actor)
+            .await?;
+        let key = auth::create_key(&mut *db, KeyOwner::User(id), Some("welcome e-mail"), actor).await?;
         return Ok((id, Some(key)));
     }
     let id =
@@ -127,8 +133,14 @@ pub async fn create(
     .bind(body.role.unwrap_or(Role::Reporter))
     .fetch_one(&mut *tx)
     .await?;
+    Event::new("user.created", "user", user.id)
+        .changes(serde_json::json!({ "email": user.email, "name": user.name, "role": user.role }))
+        .record(&mut *tx, (&principal).into())
+        .await?;
     let key = match body.send_key.unwrap_or(true) {
-        true => Some(auth::create_key(&mut *tx, KeyOwner::User(user.id), Some("welcome e-mail")).await?),
+        true => {
+            Some(auth::create_key(&mut tx, KeyOwner::User(user.id), Some("welcome e-mail"), (&principal).into()).await?)
+        }
         false => None,
     };
     tx.commit().await?;
@@ -179,15 +191,21 @@ pub async fn update(
         return Err(ApiError::bad_request("you cannot remove your own admin role"));
     }
     let current = load(&state, id).await?;
-    let user = sqlx::query_as(
+    let mut tx = state.db.begin().await?;
+    let user: User = sqlx::query_as(
         "UPDATE users SET name = $2, role = $3, updated_at = now() WHERE id = $1
          RETURNING id, email, name, role, created_at, updated_at",
     )
     .bind(id)
-    .bind(body.name.map_or(current.name, |n| non_blank(Some(n))))
+    .bind(body.name.map_or_else(|| current.name.clone(), |n| non_blank(Some(n))))
     .bind(body.role.unwrap_or(current.role))
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await?;
+    let diff = Diff::default().field("name", &current.name, &user.name).field("role", &current.role, &user.role);
+    if !diff.is_empty() {
+        Event::new("user.updated", "user", id).changes(diff.into_value()).record(&mut *tx, (&principal).into()).await?;
+    }
+    tx.commit().await?;
     Ok(Json(user))
 }
 
@@ -221,6 +239,12 @@ pub async fn create_key(
 ) -> ApiResult<(StatusCode, Json<NewApiKey>)> {
     principal.require_admin()?;
     load(&state, id).await?;
-    let key = auth::create_key(&state.db, KeyOwner::User(id), non_blank(body.name).as_deref()).await?;
+    let key = auth::create_key(
+        &mut *state.db.acquire().await?,
+        KeyOwner::User(id),
+        non_blank(body.name).as_deref(),
+        (&principal).into(),
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(key)))
 }

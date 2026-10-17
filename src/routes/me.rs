@@ -7,6 +7,7 @@ use crate::{
     AppState,
     auth::{self, ApiKey, KeyOwner, NewApiKey, Principal},
     error::{ApiError, ApiResult, ErrorBody},
+    events::Event,
     extract::{Json, Path},
     models::{Role, non_blank},
 };
@@ -70,7 +71,13 @@ pub async fn create_key(
     principal: Principal,
     Json(body): Json<CreateKey>,
 ) -> ApiResult<(StatusCode, Json<NewApiKey>)> {
-    let key = auth::create_key(&state.db, principal.key_owner(), non_blank(body.name).as_deref()).await?;
+    let key = auth::create_key(
+        &mut *state.db.acquire().await?,
+        principal.key_owner(),
+        non_blank(body.name).as_deref(),
+        (&principal).into(),
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(key)))
 }
 
@@ -91,19 +98,29 @@ pub async fn revoke_key(
         KeyOwner::User(id) => (Some(id), None),
         KeyOwner::App(id) => (None, Some(id)),
     };
-    let revoked = sqlx::query(
-        "UPDATE api_keys SET revoked_at = coalesce(revoked_at, now())
-         WHERE id = $1 AND ($2 OR user_id IS NOT DISTINCT FROM $3 AND app_id IS NOT DISTINCT FROM $4)",
+    let mut tx = state.db.begin().await?;
+    // `was_active` tells a fresh revocation from repeating one, which is not logged again.
+    let revoked: Option<(String, Option<Uuid>, Option<Uuid>, bool)> = sqlx::query_as(
+        "UPDATE api_keys k SET revoked_at = coalesce(k.revoked_at, now())
+         FROM (SELECT id, revoked_at IS NULL AS was_active FROM api_keys WHERE id = $1) old
+         WHERE k.id = old.id AND ($2 OR k.user_id IS NOT DISTINCT FROM $3 AND k.app_id IS NOT DISTINCT FROM $4)
+         RETURNING k.prefix, k.user_id, k.app_id, old.was_active",
     )
     .bind(id)
     .bind(principal.is_admin())
     .bind(user_id)
     .bind(app_id)
-    .execute(&state.db)
-    .await?
-    .rows_affected();
-    if revoked == 0 {
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((prefix, owner_user, owner_app, was_active)) = revoked else {
         return Err(ApiError::not_found("key"));
+    };
+    if was_active {
+        Event::new("key.revoked", "key", id)
+            .changes(serde_json::json!({ "prefix": prefix, "user_id": owner_user, "app_id": owner_app }))
+            .record(&mut *tx, (&principal).into())
+            .await?;
     }
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }

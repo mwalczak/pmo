@@ -9,7 +9,9 @@ use http_body_util::BodyExt;
 use pmo::{
     AppState,
     auth::{self, KeyOwner},
+    events::Actor,
     mail::{Mail, Mailer},
+    storage::Storage,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -29,6 +31,10 @@ impl TestApp {
             db,
             mailer: Arc::new(Mailer::Memory(mails.clone())),
             public_url: Some("https://pmo.test".to_owned()),
+            storage: Arc::new(Storage::new(
+                std::env::temp_dir().join(format!("pmo-test-{}", Uuid::now_v7())),
+                4 * 1024 * 1024,
+            )),
         };
         Self { router: pmo::app(state.clone()), state, mails }
     }
@@ -42,7 +48,8 @@ impl TestApp {
                 .fetch_one(&self.state.db)
                 .await
                 .unwrap();
-        auth::create_key(&self.state.db, KeyOwner::User(id), None).await.unwrap().key
+        let mut db = self.state.db.acquire().await.unwrap();
+        auth::create_key(&mut db, KeyOwner::User(id), None, Actor::System).await.unwrap().key
     }
 
     async fn call(&self, method: Method, path: &str, key: Option<&str>, body: Option<Value>) -> (StatusCode, Value) {
@@ -105,6 +112,12 @@ async fn public_routes_and_auth(db: PgPool) {
     let (s, doc) = app.call(Method::GET, "/openapi.json", None, None).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(doc["servers"][0]["url"], "https://pmo.test");
+
+    let (s, _) = app.call(Method::GET, "/", None, None).await;
+    assert_eq!(s, StatusCode::SEE_OTHER, "the root leads to the docs");
+    let (s, skill) = app.call(Method::GET, "/skills/pmo-thin-client/SKILL.md", None, None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(skill.as_str().unwrap().starts_with("---\nname: pmo-thin-client"));
 
     let (s, body) = app.call(Method::GET, "/v1/me", None, None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
@@ -432,4 +445,221 @@ async fn configured_admins_get_a_key_once(db: PgPool) {
 
     pmo::ensure_admins(&app.state, &admins).await.unwrap();
     assert!(app.take_mails().is_empty());
+}
+
+impl TestApp {
+    /// Uploads `bytes` as the `file` field of a multipart form.
+    async fn upload(&self, path: &str, key: &str, filename: &str, bytes: &[u8]) -> (StatusCode, Value) {
+        let boundary = "pmo-test-boundary";
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
+             Content-Type: application/octet-stream\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .body(Body::from(body))
+            .unwrap();
+        let res = self.router.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    /// GETs raw bytes, with optional extra headers.
+    async fn download(&self, path: &str, key: &str, headers: &[(&str, &str)]) -> (StatusCode, String, Vec<u8>) {
+        let mut req = Request::builder().uri(path).header("authorization", format!("Bearer {key}"));
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let res = self.router.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = res.status();
+        let content_type =
+            res.headers().get("content-type").map(|v| v.to_str().unwrap().to_owned()).unwrap_or_default();
+        (status, content_type, res.into_body().collect().await.unwrap().to_bytes().to_vec())
+    }
+}
+
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR fake png body";
+
+#[sqlx::test]
+async fn projects_offer_platforms_and_issue_types(db: PgPool) {
+    let app = TestApp::new(db);
+    let (admin, app_key) = app.setup().await;
+
+    let config = json!({
+        "platforms": [{ "id": "web", "label": "Web" }, { "id": "Android" }, { "id": "ios", "label": "iOS" }],
+        "issue_types": [{ "id": "bug", "label": "Błąd" }, { "id": "idea", "label": "Pomysł" }],
+    });
+    let (s, project) = app.patch("/v1/projects/DM", &admin, config).await;
+    assert_eq!(s, StatusCode::OK, "{project}");
+    // Apps read what to offer from the project.
+    let (_, project) = app.get("/v1/projects/DM", &app_key).await;
+    assert_eq!(
+        project["platforms"],
+        json!([{ "id": "web", "label": "Web" }, { "id": "android", "label": "android" }, { "id": "ios", "label": "iOS" }])
+    );
+    assert_eq!(project["issue_types"], json!([{ "id": "bug", "label": "Błąd" }, { "id": "idea", "label": "Pomysł" }]));
+
+    let report = |t: &str, platform: &str| json!({ "type": t, "title": "x", "platform": platform, "reporter": { "email": "ola@example.com" } });
+    let (s, issue) = app.post("/v1/projects/DM/issues", &app_key, report("bug", "WEB")).await;
+    assert_eq!((s, &issue["platform"]), (StatusCode::CREATED, &json!("web")));
+    let (s, body) = app.post("/v1/projects/DM/issues", &app_key, report("bug", "windows")).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(body["message"].as_str().unwrap().contains("web, android, ios"));
+    let (s, _) = app.post("/v1/projects/DM/issues", &app_key, report("abuse", "web")).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "abuse is not offered in this project");
+    // Admins can still file other types, e.g. a todo.
+    let (s, todo) = app.post("/v1/projects/DM/issues", &admin, json!({ "type": "todo", "title": "Renew cert" })).await;
+    assert_eq!((s, &todo["type"]), (StatusCode::CREATED, &json!("todo")));
+
+    let (_, page) = app.get("/v1/projects/DM/issues?platform=web", &admin).await;
+    assert_eq!(keys(&page), ["DM-1"]);
+    // Reporters can correct the platform of their own report; null clears it.
+    let ola = mailed_key(&app.take_mails()[0]);
+    let (s, issue) = app.patch("/v1/issues/DM-1", &ola, json!({ "platform": "ios" })).await;
+    assert_eq!((s, &issue["platform"]), (StatusCode::OK, &json!("ios")));
+    let (_, issue) = app.patch("/v1/issues/DM-1", &ola, json!({ "platform": null })).await;
+    assert_eq!(issue["platform"], Value::Null);
+
+    for bad in [
+        json!({ "issue_types": [{ "id": "complaint" }] }),
+        json!({ "issue_types": [] }),
+        json!({ "platforms": [{ "id": "web" }, { "id": "web" }] }),
+        json!({ "platforms": [{ "id": "Web App!" }] }),
+    ] {
+        let (s, _) = app.patch("/v1/projects/DM", &admin, bad.clone()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    // New projects offer every type until configured.
+    let (_, other) = app.post("/v1/projects", &admin, json!({ "key": "XX", "name": "Other" })).await;
+    let types: Vec<&str> = other["issue_types"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap()).collect();
+    assert_eq!(types, ["bug", "idea", "abuse", "todo"]);
+    assert_eq!(other["platforms"], json!([]));
+}
+
+#[sqlx::test]
+async fn attachments(db: PgPool) {
+    let app = TestApp::new(db);
+    let (admin, app_key) = app.setup().await;
+    let report = json!({ "type": "bug", "title": "Crash", "reporter": { "email": "ola@example.com" } });
+    app.post("/v1/projects/DM/issues", &app_key, report).await;
+    let ola = mailed_key(&app.take_mails()[0]);
+    let kuba = app.user_key("kuba@example.com", "reporter").await;
+
+    // The app uploads a screenshot right after reporting.
+    let (s, a) = app.upload("/v1/issues/DM-1/attachments", &app_key, "C:\\shots\\screen.png", PNG).await;
+    assert_eq!(s, StatusCode::CREATED, "{a}");
+    assert_eq!((&a["kind"], &a["content_type"], &a["size"]), (&json!("image"), &json!("image/png"), &json!(PNG.len())));
+    assert_eq!(a["filename"], "screen.png");
+    assert_eq!(a["uploaded_by"], "dobre-mleko.app");
+    let url = a["url"].as_str().unwrap().strip_prefix("https://pmo.test").unwrap().to_owned();
+
+    // The reporter adds a recording; identical files share storage.
+    let mp4 = [b"\0\0\0\x20ftypisom".as_slice(), &[7u8; 64]].concat();
+    let (s, video) = app.upload("/v1/issues/DM-1/attachments", &ola, "rec.mp4", &mp4).await;
+    assert_eq!((s, &video["kind"]), (StatusCode::CREATED, &json!("video")));
+    let (s, _) = app.upload("/v1/issues/DM-1/attachments", &admin, "again.png", PNG).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (_, list) = app.get("/v1/issues/DM-1/attachments", &kuba).await;
+    assert_eq!(list.as_array().unwrap().len(), 3);
+
+    let (s, content_type, bytes) = app.download(&url, &kuba, &[]).await;
+    assert_eq!((s, content_type.as_str(), bytes.as_slice()), (StatusCode::OK, "image/png", PNG));
+    let (s, _, bytes) = app.download(&url, &app_key, &[("range", "bytes=0-3")]).await;
+    assert_eq!((s, bytes.as_slice()), (StatusCode::PARTIAL_CONTENT, &PNG[..4]));
+
+    // Only images and videos, within the size limit, from the reporter, its app or admins.
+    let (s, body) = app.upload("/v1/issues/DM-1/attachments", &ola, "notes.pdf", b"%PDF-1.7 hello").await;
+    assert_eq!((s, &body["error"]), (StatusCode::UNSUPPORTED_MEDIA_TYPE, &json!("unsupported_type")));
+    // Above axum's default 2 MB body limit, below MAX_UPLOAD_MB (4 MB here).
+    let three_mb = [mp4.as_slice(), &vec![1u8; 3 * 1024 * 1024]].concat();
+    let (s, body) = app.upload("/v1/issues/DM-1/attachments", &ola, "long.mp4", &three_mb).await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    let big = [PNG, &vec![0u8; 4 * 1024 * 1024]].concat();
+    let (s, _) = app.upload("/v1/issues/DM-1/attachments", &ola, "big.png", &big).await;
+    assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+    let (s, _) = app.upload("/v1/issues/DM-1/attachments", &kuba, "x.png", PNG).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // Deleting: the uploader or admins. The shared file stays until no attachment uses it.
+    let sha_path = app.state.storage.path(&hex_sha256(PNG));
+    let first = a["id"].as_str().unwrap();
+    let (s, _) = app.call(Method::DELETE, &format!("/v1/attachments/{first}"), Some(&ola), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = app.call(Method::DELETE, &format!("/v1/attachments/{first}"), Some(&app_key), None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert!(sha_path.exists());
+    app.call(Method::DELETE, "/v1/issues/DM-1", Some(&admin), None).await;
+    assert!(!sha_path.exists());
+
+    // Attachments of private issues are as private as the issue.
+    let abuse = json!({ "type": "abuse", "title": "Spam", "reporter": { "email": "ola@example.com" } });
+    app.post("/v1/projects/DM/issues", &app_key, abuse).await;
+    let (_, a) = app.upload("/v1/issues/DM-2/attachments", &ola, "proof.png", PNG).await;
+    let url = a["url"].as_str().unwrap().strip_prefix("https://pmo.test").unwrap().to_owned();
+    assert_eq!(app.download(&url, &kuba, &[]).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.download(&url, &app_key, &[]).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.download(&url, &admin, &[]).await.0, StatusCode::OK);
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+#[sqlx::test]
+async fn action_log(db: PgPool) {
+    let app = TestApp::new(db);
+    let (admin, app_key) = app.setup().await;
+    let report = json!({ "type": "bug", "title": "Crash", "reporter": { "email": "ola@example.com", "name": "Ola" } });
+    app.post("/v1/projects/DM/issues", &app_key, report).await;
+    let ola = mailed_key(&app.take_mails()[0]);
+    app.patch("/v1/issues/DM-1", &admin, json!({ "status": "accepted", "priority": "P2", "title": "Crash" })).await;
+    app.upload("/v1/issues/DM-1/attachments", &ola, "s.png", PNG).await;
+
+    // An issue's history, for anyone who can see it: who, what, when.
+    let (s, history) = app.get("/v1/issues/DM-1/events", &ola).await;
+    assert_eq!(s, StatusCode::OK);
+    let actions: Vec<&str> = history.as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
+    assert_eq!(actions, ["issue.created", "issue.updated", "attachment.added"]);
+    assert_eq!(
+        history[0]["actor"],
+        json!({ "kind": "app", "id": history[0]["actor"]["id"], "name": "dobre-mleko.app" })
+    );
+    assert_eq!(history[0]["changes"]["title"], "Crash");
+    assert_eq!(history[0]["changes"]["reporter"]["name"], "Ola");
+    // Unchanged fields (the title) are left out.
+    assert_eq!(
+        history[1]["changes"],
+        json!({ "status": { "from": "reported", "to": "accepted" }, "priority": { "from": "P3", "to": "P2" } })
+    );
+    assert_eq!(history[1]["actor"]["kind"], "user");
+    assert!(history[1]["actor"].get("email").is_none(), "only admins see e-mails");
+    assert_eq!(history[2]["actor"]["name"], "Ola");
+    let (_, history) = app.get("/v1/issues/DM-1/events", &admin).await;
+    assert_eq!(history[1]["actor"]["email"], "admin@example.com");
+
+    // The whole log, for admins: the reporter's account and key were created by the app.
+    let (s, _) = app.get("/v1/events", &ola).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (_, me) = app.get("/v1/me", &app_key).await;
+    let app_id = me["id"].as_str().unwrap();
+    let (_, page) = app.get(&format!("/v1/events?app_id={app_id}"), &admin).await;
+    let actions: Vec<&str> = page["items"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
+    assert_eq!(actions, ["issue.created", "key.created", "user.created"]);
+
+    // History outlives deletion.
+    app.call(Method::DELETE, "/v1/issues/DM-1", Some(&admin), None).await;
+    let (_, page) = app.get("/v1/events?issue=dm-1", &admin).await;
+    let actions: Vec<&str> = page["items"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
+    assert_eq!(actions, ["issue.deleted", "attachment.added", "issue.updated", "issue.created"]);
+    let (_, page) = app.get("/v1/events?action=project.created&project=DM", &admin).await;
+    assert_eq!(page["items"][0]["changes"]["key"], "DM");
+    assert_eq!(page["items"][0]["actor"]["email"], "admin@example.com");
 }
