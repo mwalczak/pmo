@@ -663,3 +663,31 @@ async fn action_log(db: PgPool) {
     assert_eq!(page["items"][0]["changes"]["key"], "DM");
     assert_eq!(page["items"][0]["actor"]["email"], "admin@example.com");
 }
+
+#[sqlx::test]
+async fn admins_delete_users_without_issues(db: PgPool) {
+    let app = TestApp::new(db);
+    let (admin, app_key) = app.setup().await;
+    let (_, typo) = app.post("/v1/users", &admin, json!({ "email": "typo@example.com", "role": "admin" })).await;
+    let typo_key = mailed_key(&app.take_mails()[0]);
+    let id = typo["id"].as_str().unwrap();
+
+    let (s, _) = app.call(Method::DELETE, &format!("/v1/users/{id}"), Some(&typo_key), None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "admins cannot delete themselves");
+    let (s, _) = app.call(Method::DELETE, &format!("/v1/users/{id}"), Some(&admin), None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = app.get("/v1/me", &typo_key).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "the keys went with the account");
+    let (s, _) = app.get(&format!("/v1/users/{id}"), &admin).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (_, log) = app.get(&format!("/v1/events?entity_id={id}&action=user.deleted"), &admin).await;
+    assert_eq!(log["items"][0]["changes"]["email"], "typo@example.com");
+
+    let report = json!({ "type": "bug", "title": "x", "reporter": { "email": "ola@example.com" } });
+    let (_, issue) = app.post("/v1/projects/DM/issues", &app_key, report).await;
+    let reporter = issue["reporter"]["id"].as_str().unwrap();
+    let (s, _) = app.call(Method::DELETE, &format!("/v1/users/{reporter}"), Some(&admin), None).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    let (s, _) = app.call(Method::DELETE, &format!("/v1/users/{reporter}"), Some(&app_key), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+}

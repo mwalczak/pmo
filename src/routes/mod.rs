@@ -82,7 +82,7 @@ fn api_router() -> OpenApiRouter<AppState> {
         )
         .routes(routes!(attachments::download, attachments::delete))
         .routes(routes!(users::list, users::create))
-        .routes(routes!(users::get, users::update))
+        .routes(routes!(users::get, users::update, users::delete))
         .routes(routes!(users::list_keys, users::create_key))
         .routes(routes!(apps::list, apps::create))
         .routes(routes!(apps::get, apps::update, apps::delete))

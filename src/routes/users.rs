@@ -209,6 +209,42 @@ pub async fn update(
     Ok(Json(user))
 }
 
+/// Delete a user.
+///
+/// Removes the account and its keys; the action log keeps what they did. Users who reported issues cannot be
+/// deleted (their issues name them); admins cannot delete themselves.
+#[utoipa::path(
+    delete, operation_id = "deleteUser", path = "/v1/users/{id}", tag = "users", params(("id" = Uuid, Path)),
+    responses((status = 204), (status = 404, body = ErrorBody), (status = 409, body = ErrorBody, description = "Has issues"))
+)]
+pub async fn delete(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    let admin = principal.require_admin()?;
+    if admin.id == id {
+        return Err(ApiError::bad_request("you cannot delete yourself"));
+    }
+    let user = load(&state, id).await?;
+    let issues: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM issues WHERE reporter_id = $1").bind(id).fetch_one(&state.db).await?;
+    if issues > 0 {
+        return Err(ApiError::conflict(format!(
+            "{} reported {issues} issue(s); revoke their keys instead",
+            user.email
+        )));
+    }
+    let mut tx = state.db.begin().await?;
+    sqlx::query("DELETE FROM users WHERE id = $1").bind(id).execute(&mut *tx).await?;
+    Event::new("user.deleted", "user", id)
+        .changes(serde_json::json!({ "email": user.email, "name": user.name, "role": user.role }))
+        .record(&mut *tx, (&principal).into())
+        .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// List a user's keys.
 #[utoipa::path(
     get, operation_id = "listUserKeys", path = "/v1/users/{id}/keys", tag = "users", params(("id" = Uuid, Path)),
