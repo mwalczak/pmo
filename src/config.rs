@@ -14,6 +14,8 @@ pub struct Config {
     pub storage_dir: String,
     /// Largest attachment, in bytes.
     pub max_upload_bytes: u64,
+    /// Requests per key per minute; 0 turns limiting off.
+    pub rate_limit_per_minute: u32,
 }
 
 impl Config {
@@ -34,6 +36,11 @@ impl Config {
                 .unwrap_or(100)
                 * 1024
                 * 1024,
+            rate_limit_per_minute: var("RATE_LIMIT_PER_MINUTE")
+                .map(|v| v.parse())
+                .transpose()
+                .context("RATE_LIMIT_PER_MINUTE")?
+                .unwrap_or(600),
             mail_from: var("MAIL_FROM")
                 .or_else(|| var("SMTP_USERNAME").map(|u| format!("PMO <{u}>")))
                 .unwrap_or_else(|| "PMO <pmo@localhost>".to_owned()),

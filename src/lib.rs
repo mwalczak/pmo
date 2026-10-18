@@ -5,6 +5,7 @@ pub mod events;
 pub mod extract;
 pub mod mail;
 pub mod models;
+pub mod ratelimit;
 pub mod routes;
 pub mod storage;
 
@@ -24,6 +25,8 @@ pub struct AppState {
     pub public_url: Option<String>,
     /// Attachment files.
     pub storage: Arc<storage::Storage>,
+    /// Requests per key per minute.
+    pub rate_limiter: Arc<ratelimit::RateLimiter>,
 }
 
 /// Makes the configured e-mails admins, creating their users if needed. An admin who never had a key gets one

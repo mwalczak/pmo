@@ -51,6 +51,7 @@ async fn serve() -> Result<()> {
         mailer: Arc::new(Mailer::from_config(config.smtp.as_ref(), &config.mail_from)?),
         public_url: config.public_url.clone(),
         storage: Arc::new(storage),
+        rate_limiter: Arc::new(pmo::ratelimit::RateLimiter::new(config.rate_limit_per_minute)),
     };
     pmo::ensure_admins(&state, &config.admin_emails).await?;
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port)).await?;

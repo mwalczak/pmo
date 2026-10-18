@@ -26,6 +26,10 @@ struct TestApp {
 
 impl TestApp {
     fn new(db: PgPool) -> Self {
+        Self::with_rate_limit(db, 0)
+    }
+
+    fn with_rate_limit(db: PgPool, per_minute: u32) -> Self {
         let mails = Arc::new(Mutex::new(Vec::new()));
         let state = AppState {
             db,
@@ -35,6 +39,7 @@ impl TestApp {
                 std::env::temp_dir().join(format!("pmo-test-{}", Uuid::now_v7())),
                 4 * 1024 * 1024,
             )),
+            rate_limiter: Arc::new(pmo::ratelimit::RateLimiter::new(per_minute)),
         };
         Self { router: pmo::app(state.clone()), state, mails }
     }
@@ -690,4 +695,43 @@ async fn admins_delete_users_without_issues(db: PgPool) {
     assert_eq!(s, StatusCode::CONFLICT);
     let (s, _) = app.call(Method::DELETE, &format!("/v1/users/{reporter}"), Some(&app_key), None).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
+}
+
+#[sqlx::test]
+async fn keys_are_rate_limited(db: PgPool) {
+    let app = TestApp::with_rate_limit(db, 5);
+    let admin = app.user_key("admin@example.com", "admin").await;
+    let other = app.user_key("ola@example.com", "reporter").await;
+    for _ in 0..5 {
+        assert_eq!(app.get("/v1/me", &admin).await.0, StatusCode::OK);
+    }
+    let req = Request::builder().uri("/v1/me").header("authorization", format!("Bearer {admin}")).body(Body::empty());
+    let res = app.router.clone().oneshot(req.unwrap()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry: u64 = res.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+    assert!((1..=12).contains(&retry), "{retry}");
+    let body: Value = serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["error"], "rate_limited");
+    assert_eq!(app.get("/v1/me", &other).await.0, StatusCode::OK, "each key has its own limit");
+}
+
+#[sqlx::test]
+async fn app_keys_are_refused_from_browsers(db: PgPool) {
+    let app = TestApp::new(db);
+    let (admin, app_key) = app.setup().await;
+    let from_page = |key: &str| {
+        Request::builder()
+            .uri("/v1/projects/DM/issues")
+            .header("authorization", format!("Bearer {key}"))
+            .header("origin", "https://someone.example")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let res = app.router.clone().oneshot(from_page(&app_key)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let body: Value = serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(body["message"].as_str().unwrap().contains("backend"));
+    // Server-side calls (no Origin) work, and user keys (agents, tools) are not affected.
+    assert_eq!(app.get("/v1/projects/DM/issues", &app_key).await.0, StatusCode::OK);
+    assert_eq!(app.router.clone().oneshot(from_page(&admin)).await.unwrap().status(), StatusCode::OK);
 }

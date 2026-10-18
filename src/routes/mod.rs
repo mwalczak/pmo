@@ -30,7 +30,9 @@ use crate::AppState;
         title = "PMO API",
         description = "Headless project management: projects, milestones and issues, for client apps and AI agents.\n\n\
 Authenticate every `/v1` request with `Authorization: Bearer <key>`. User keys (`pmo_u_…`) act as that user; \
-app keys (`pmo_a_…`) are for server-to-server calls and only reach the app's projects.\n\n\
+app keys (`pmo_a_…`) are for server-to-server calls and only reach the app's projects. App keys are refused when \
+the request comes from a browser (it has an `Origin` header): call PMO from your backend. Each key can make \
+`RATE_LIMIT_PER_MINUTE` requests a minute (600 by default); beyond that the API answers 429 with `Retry-After`.\n\n\
 When an app reports an issue for an e-mail that has no account yet, PMO creates a reporter account and e-mails \
 them a personal key.\n\n\
 Building an app's report page? Agents: read `/skills/pmo-thin-client/SKILL.md`.",
@@ -98,10 +100,15 @@ pub fn openapi(public_url: Option<&str>) -> utoipa::openapi::OpenApi {
         .description("Missing or invalid API key")
         .content("application/json", Content::new(Some(Ref::from_schema_name("ErrorBody"))))
         .build();
+    let rate_limited = ResponseBuilder::new()
+        .description("Too many requests for this key (`RATE_LIMIT_PER_MINUTE`); retry after `Retry-After` seconds")
+        .content("application/json", Content::new(Some(Ref::from_schema_name("ErrorBody"))))
+        .build();
     for item in doc.paths.paths.values_mut() {
         let operations = [&mut item.get, &mut item.post, &mut item.patch, &mut item.delete];
         for operation in operations.into_iter().flatten() {
             operation.responses.responses.entry("401".to_owned()).or_insert_with(|| unauthorized.clone().into());
+            operation.responses.responses.entry("429".to_owned()).or_insert_with(|| rate_limited.clone().into());
             for (status, response) in operation.responses.responses.iter_mut() {
                 if let RefOr::T(response) = response
                     && response.description.is_empty()

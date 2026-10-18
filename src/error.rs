@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::rejection::{JsonRejection, PathRejection, QueryRejection},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -18,6 +18,8 @@ pub enum ApiError {
     Conflict(String),
     PayloadTooLarge(String),
     UnsupportedMediaType(String),
+    /// Seconds until the key may call again.
+    TooManyRequests(u64),
     Internal(anyhow::Error),
 }
 
@@ -25,7 +27,7 @@ pub enum ApiError {
 #[derive(Serialize, ToSchema)]
 pub struct ErrorBody {
     /// Machine-readable code: `bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`, `too_large`,
-    /// `unsupported_type` or `internal`.
+    /// `unsupported_type`, `rate_limited` or `internal`.
     pub error: &'static str,
     pub message: String,
 }
@@ -59,6 +61,14 @@ impl IntoResponse for ApiError {
             Self::Conflict(m) => (StatusCode::CONFLICT, "conflict", m),
             Self::PayloadTooLarge(m) => (StatusCode::PAYLOAD_TOO_LARGE, "too_large", m),
             Self::UnsupportedMediaType(m) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_type", m),
+            Self::TooManyRequests(secs) => {
+                let body = ErrorBody {
+                    error: "rate_limited",
+                    message: format!("too many requests for this key; retry in {secs} s"),
+                };
+                return (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, secs.to_string())], Json(body))
+                    .into_response();
+            }
             Self::Internal(e) => {
                 tracing::error!(error = ?e, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error".to_owned())

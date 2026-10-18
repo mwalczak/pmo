@@ -186,6 +186,8 @@ impl FromRequestParts<AppState> for Principal {
         .await?
         .ok_or(ApiError::Unauthorized)?;
 
+        state.rate_limiter.check(found.id).map_err(ApiError::TooManyRequests)?;
+
         // Record use at most once a minute, without delaying the request.
         if found.last_used_at.is_none_or(|t| Utc::now() - t > chrono::TimeDelta::minutes(1)) {
             let db = state.db.clone();
@@ -200,6 +202,13 @@ impl FromRequestParts<AppState> for Principal {
         match found {
             KeyLookup { user_id: Some(id), email: Some(email), role: Some(role), user_name, .. } => {
                 Ok(Self::User(CurrentUser { id, email, name: user_name, role }))
+            }
+            // App keys are for servers. Browsers send Origin (servers' HTTP clients don't), so an app key used from a
+            // web page is refused even if PMO ever answers CORS: it would be in the page for anyone to read.
+            KeyLookup { app_id: Some(_), .. } if parts.headers.contains_key(axum::http::header::ORIGIN) => {
+                Err(ApiError::forbidden(
+                    "app keys are for server-to-server calls; call PMO from your backend, never from a browser",
+                ))
             }
             KeyLookup { app_id: Some(id), app_name: Some(name), .. } => Ok(Self::App(CurrentApp { id, name })),
             _ => Err(ApiError::Unauthorized),

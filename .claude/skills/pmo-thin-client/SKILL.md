@@ -26,7 +26,10 @@ that reads everything it offers from PMO. The reference implementation is dobre-
 4. **Abuse reports are private.** PMO never lists them to apps. Don't offer "similar reports" for them, and tell
    the user only admins will see the report.
 5. **Fail soft.** Without configuration, or when PMO is down, the proxy answers 503 (`reports_unavailable`) and the
-   page says reporting is unavailable. A PMO 400 becomes the app's validation error (422).
+   page says reporting is unavailable. A PMO 400 becomes the app's validation error (422). PMO limits each key's
+   requests per minute (429 with `Retry-After`), so treat 429 as unavailable too, and cache what you can (the options).
+6. **PMO refuses app keys from browsers.** A request that carries an `Origin` header gets 403. PMO also sends no
+   CORS headers. Server-side HTTP clients (Node `fetch`, curl) send no `Origin`, so a backend proxy just works.
 
 ## Setup (ask the PMO admin)
 

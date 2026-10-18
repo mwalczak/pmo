@@ -17,7 +17,7 @@ Rust · Axum · SQLx · Postgres 17 (`pg_trgm` for typo-tolerant search) · a 15
 |---|---|
 | **Users** | `admin` (manages everything, triages issues) or `reporter` (reports issues, edits the text of their own). |
 | **Apps** | Client apps such as `dobre-mleko.app`. They call PMO **server-to-server** with an app key and only reach their own projects. |
-| **Keys** | `Authorization: Bearer <key>`. User keys are `pmo_u_…`, app keys `pmo_a_…`. Only their SHA-256 is stored. Anyone can create more keys and revoke their own. |
+| **Keys** | `Authorization: Bearer <key>`. User keys are `pmo_u_…`, app keys `pmo_a_…`. Only their SHA-256 is stored. Anyone can create more keys and revoke their own. Each key is rate limited (`RATE_LIMIT_PER_MINUTE`). App keys are server-to-server only: PMO sends no CORS headers, so browsers cannot call it, and it refuses app keys on requests with an `Origin` header. |
 | **Projects** | Have a short key (`DM`) that prefixes issue keys (`DM-12`), and say what apps offer in their report forms: `platforms` and `issue_types`, each `[{id, label}]` (labels in the project's language). Reporters can only choose the project's issue types; admins can use any. |
 | **Milestones** | Belong to a project; `open`/`closed`, optional due date. |
 | **Issues** | `type` bug/idea/abuse/todo · `priority` P1–P5 (default P3, set by admins) · `status` reported → accepted → in_progress → done / wont_fix / duplicate (with `duplicate_of`) · `platform`, one of the project's. |
@@ -97,6 +97,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings
 | `MAIL_FROM` | Default `PMO <SMTP_USERNAME>` |
 | `STORAGE_DIR` | Attachment files, default `./data/attachments` (a volume in production) |
 | `MAX_UPLOAD_MB` | Largest attachment, default `100` |
+| `RATE_LIMIT_PER_MINUTE` | Requests per key per minute (bursts up to it, refilled evenly), default `600`; `0` turns it off. Beyond it: 429 with `Retry-After` |
 
 Without SMTP, e-mails are only logged; their bodies (which can contain keys) appear only at `RUST_LOG=debug`.
 
