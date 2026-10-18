@@ -1,5 +1,6 @@
 mod apps;
 mod attachments;
+mod comments;
 mod events;
 mod issues;
 mod me;
@@ -45,6 +46,7 @@ Building an app's report page? Agents: read `/skills/pmo-thin-client/SKILL.md`."
         (name = "milestones", description = "Planned releases or goals within a project. At most one is open at a time, and new issues go into it"),
         (name = "issues", description = "Bugs, ideas, abuse reports and things to do"),
         (name = "attachments", description = "Screenshots and recordings on issues"),
+        (name = "comments", description = "Comments on issues, shown to whoever sees the issue; internal ones to admins only"),
         (name = "events", description = "The action log: who did what, when, and what changed"),
         (name = "users", description = "Admin only"),
         (name = "apps", description = "Client apps and their keys. Admin only"),
@@ -74,6 +76,8 @@ fn api_router() -> OpenApiRouter<AppState> {
         .routes(routes!(milestones::get, milestones::update, milestones::delete))
         .routes(routes!(issues::list, issues::create))
         .routes(routes!(issues::get, issues::update, issues::delete))
+        .routes(routes!(comments::list, comments::create))
+        .routes(routes!(comments::update, comments::delete))
         .routes(routes!(events::for_issue))
         .routes(routes!(events::list))
         // Uploads stream to disk and Storage enforces MAX_UPLOAD_MB; other bodies keep axum's 2 MB limit.

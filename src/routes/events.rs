@@ -109,11 +109,16 @@ pub async fn for_issue(
     Path(key): Path<String>,
 ) -> ApiResult<Json<Vec<EventEntry>>> {
     let issue = issues::load(&state, &principal, &key).await?;
-    let rows: Vec<EventRow> =
-        sqlx::query_as(sqlx::AssertSqlSafe(format!("{SELECT} WHERE e.issue_id = $1 ORDER BY e.at, e.id")))
-            .bind(issue.id)
-            .fetch_all(&state.db)
-            .await?;
+    // Internal comments (and their text in the log) are for admins only.
+    let rows: Vec<EventRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "{SELECT} WHERE e.issue_id = $1
+           AND ($2 OR NOT (e.entity = 'comment' AND coalesce((e.changes ->> 'internal')::boolean, false)))
+         ORDER BY e.at, e.id"
+    )))
+    .bind(issue.id)
+    .bind(principal.is_admin())
+    .fetch_all(&state.db)
+    .await?;
     let admin = principal.is_admin();
     Ok(Json(rows.into_iter().map(|r| r.into_entry(admin)).collect()))
 }

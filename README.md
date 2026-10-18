@@ -21,6 +21,7 @@ Rust · Axum · SQLx · Postgres 17 (`pg_trgm` for typo-tolerant search) · a 15
 | **Projects** | Have a short key (`DM`) that prefixes issue keys (`DM-12`), and say what apps offer in their report forms: `platforms` and `issue_types`, each `[{id, label}]` (labels in the project's language). Reporters can only choose the project's issue types; admins can use any. |
 | **Milestones** | Belong to a project; `open`/`closed`, optional due date. A project has **at most one open milestone**, and every new issue goes into it automatically (admins can pick another). To start the next one, close the current one first. |
 | **Issues** | `type` bug/idea/abuse/todo · `priority` P1–P5 (default P3, set by admins) · `status` reported → accepted → in_progress → in_review → waiting_for_release → done, or wont_fix / duplicate (with `duplicate_of`); the first five are "open" · `platform`, one of the project's. |
+| **Comments** | On issues: anyone who sees the issue reads its public comments and can add one; admins can also write `internal` ones (admins only). A status change can carry a comment (`PATCH /v1/issues/{key}` with `comment`), e.g. why an issue won't be fixed; the reporter's status e-mail includes it, and they are e-mailed about other people's public comments too. |
 | **Attachments** | Screenshots and recordings on issues: images (PNG, JPEG, GIF, WebP, HEIC, AVIF) and videos (MP4, MOV, WebM), the type detected from the contents, up to `MAX_UPLOAD_MB` each and 20 per issue. Stored on a volume under their SHA-256. Visible to whoever sees the issue; downloads support `Range`. |
 | **Action log** | Every change is logged: who (user, app or `system`), what (`issue.updated`, `attachment.added`, `key.revoked`, …), when, and the changed fields as `{"from", "to"}`. It outlives what it describes. |
 
@@ -41,6 +42,7 @@ only to admins and the reporter themselves.
 | `GET/POST /v1/projects` · `GET/PATCH /v1/projects/{key}` | Projects (writes: admin) |
 | `GET/POST /v1/projects/{key}/milestones` · `GET/PATCH/DELETE /v1/milestones/{id}` | Milestones (writes: admin) |
 | `GET/POST /v1/projects/{key}/issues` · `GET/PATCH/DELETE /v1/issues/{key}` | Issues |
+| `GET/POST /v1/issues/{key}/comments` · `PATCH/DELETE /v1/comments/{id}` | Comments (edit and delete: the author or admins) |
 | `GET/POST /v1/issues/{key}/attachments` · `GET/DELETE /v1/attachments/{id}` | Attachments (upload: multipart `file`) |
 | `GET /v1/issues/{key}/events` · `GET /v1/events` | An issue's history; the whole log (admin, filterable by project, issue, action, actor, time) |
 | `/v1/users…` · `/v1/apps…` | Admin only: users, apps and their keys |

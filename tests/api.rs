@@ -805,3 +805,85 @@ async fn new_issues_go_into_the_open_milestone(db: PgPool) {
     let (_, issue) = app.post("/v1/projects/DM/issues", &app_key, report()).await;
     assert_eq!(issue["milestone"]["name"], "1.0");
 }
+
+#[sqlx::test]
+async fn comments(db: PgPool) {
+    let app = TestApp::new(db);
+    let (admin, app_key) = app.setup().await;
+    let report = json!({ "type": "bug", "title": "No dark map", "reporter": { "email": "ola@example.com" } });
+    app.post("/v1/projects/DM/issues", &app_key, report).await;
+    let ola = mailed_key(&app.take_mails()[0]);
+    let kuba = app.user_key("kuba@example.com", "reporter").await;
+
+    // Closing with a comment: one call, and the reporter's e-mail carries it.
+    let close = json!({ "status": "wont_fix", "comment": "The map tiles have no dark style yet." });
+    let (s, issue) = app.patch("/v1/issues/DM-1", &admin, close).await;
+    assert_eq!((s, &issue["status"]), (StatusCode::OK, &json!("wont_fix")));
+    let mails = app.take_mails();
+    assert_eq!(mails.len(), 1);
+    assert!(mails[0].subject.ends_with("wont fix"));
+    assert!(mails[0].body.contains("The map tiles have no dark style yet."));
+
+    // An internal note: admins only, no e-mail.
+    let note = json!({ "body": "Revisit when OpenFreeMap ships dark tiles.", "internal": true });
+    let (s, internal) = app.post("/v1/issues/DM-1/comments", &admin, note).await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert!(app.take_mails().is_empty());
+    let (s, _) = app.post("/v1/issues/DM-1/comments", &ola, json!({ "body": "x", "internal": true })).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // Whoever sees the issue sees its public comments, apps included.
+    for key in [&ola, &kuba, &app_key] {
+        let (_, list) = app.get("/v1/issues/DM-1/comments", key).await;
+        let bodies: Vec<&str> = list.as_array().unwrap().iter().map(|c| c["body"].as_str().unwrap()).collect();
+        assert_eq!(bodies, ["The map tiles have no dark style yet."]);
+    }
+    let (_, list) = app.get("/v1/issues/DM-1/comments", &admin).await;
+    assert_eq!(list.as_array().unwrap().len(), 2);
+    assert_eq!(list[0]["author"]["kind"], "user");
+    let internal_id = internal["id"].as_str().unwrap();
+    let (s, _) = app.patch(&format!("/v1/comments/{internal_id}"), &ola, json!({ "body": "hi" })).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "internal comments don't exist for others");
+
+    // The reporter answers (no mail to themselves); someone else's comment mails the reporter.
+    let (s, own) = app.post("/v1/issues/DM-1/comments", &ola, json!({ "body": "OK, thanks!" })).await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert!(app.take_mails().is_empty());
+    let (_, by_app) = app.post("/v1/issues/DM-1/comments", &app_key, json!({ "body": "Seen it too." })).await;
+    assert_eq!(by_app["author"], json!({ "kind": "app", "id": by_app["author"]["id"], "name": "dobre-mleko.app" }));
+    let mails = app.take_mails();
+    assert_eq!(mails.len(), 1);
+    assert!(mails[0].body.starts_with("dobre-mleko.app commented on your report DM-1"));
+
+    // Authors and admins edit and delete; others can't.
+    let own_id = own["id"].as_str().unwrap();
+    let (s, _) = app.patch(&format!("/v1/comments/{own_id}"), &kuba, json!({ "body": "mine" })).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, edited) = app.patch(&format!("/v1/comments/{own_id}"), &ola, json!({ "body": "OK, thank you!" })).await;
+    assert_eq!((s, &edited["body"]), (StatusCode::OK, &json!("OK, thank you!")));
+    let (s, _) = app.call(Method::DELETE, &format!("/v1/comments/{own_id}"), Some(&admin), None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = app.post("/v1/issues/DM-1/comments", &ola, json!({ "body": "  " })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // The history logs comments, keeping internal ones from non-admins.
+    let actions = |h: &Value| -> Vec<String> {
+        h.as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap().to_owned()).collect()
+    };
+    let (_, history) = app.get("/v1/issues/DM-1/events", &ola).await;
+    assert_eq!(
+        actions(&history),
+        [
+            "issue.created",
+            "issue.updated",
+            "comment.added",
+            "comment.added",
+            "comment.added",
+            "comment.updated",
+            "comment.deleted"
+        ]
+    );
+    assert!(!history.to_string().contains("OpenFreeMap"));
+    let (_, history) = app.get("/v1/issues/DM-1/events", &admin).await;
+    assert!(history.to_string().contains("OpenFreeMap"));
+}

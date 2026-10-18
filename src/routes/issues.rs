@@ -95,6 +95,14 @@ impl IssueRow {
         format!("{}-{}", self.project, self.number)
     }
 
+    pub(super) fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub(super) fn reporter_email(&self) -> &str {
+        &self.reporter_email
+    }
+
     fn into_issue(self, principal: &Principal) -> Issue {
         let sees_email = principal.is_admin() || principal.user().is_some_and(|u| u.id == self.reporter_id);
         Issue {
@@ -515,6 +523,11 @@ pub struct UpdateIssue {
     #[serde(default, deserialize_with = "double_option")]
     #[schema(value_type = Option<String>, example = "DM-3")]
     pub duplicate_of: Option<Option<String>>,
+    /// Adds a comment with the change, e.g. why the issue won't be fixed. It is included in the status e-mail.
+    #[schema(example = "We won't change this: the map needs location access to show places near you.")]
+    pub comment: Option<String>,
+    /// Admins only: make that comment visible to admins only. Default `false`.
+    pub comment_internal: Option<bool>,
 }
 
 /// Update or triage an issue.
@@ -630,21 +643,31 @@ pub async fn update(
             .record(&mut *tx, (&principal).into())
             .await?;
     }
+    let comment_internal = body.comment_internal.unwrap_or(false);
+    let comment = body.comment.as_deref().filter(|c| !c.trim().is_empty());
+    if let Some(text) = comment {
+        super::comments::add(&mut tx, &principal, &updated, text, comment_internal).await?;
+    }
     tx.commit().await?;
+    let public_comment = comment.filter(|_| !comment_internal).map(str::trim);
     if status != current.status && !is_reporter {
-        state.mailer.send(status_mail(&updated));
+        state.mailer.send(status_mail(&updated, public_comment));
+    } else if let Some(text) = public_comment.filter(|_| !is_reporter) {
+        let author = principal.user().and_then(|u| u.name.clone());
+        state.mailer.send(super::comments::comment_mail(&updated, text, author.as_deref()));
     }
     Ok(Json(updated.into_issue(&principal)))
 }
 
-fn status_mail(issue: &IssueRow) -> Mail {
+fn status_mail(issue: &IssueRow, comment: Option<&str>) -> Mail {
     let key = format!("{}-{}", issue.project, issue.number);
     let status = issue.status.as_str().replace('_', " ");
     let duplicate = issue.duplicate_of.as_ref().map_or_else(String::new, |d| format!(" It duplicates {d}."));
+    let comment = comment.map_or_else(String::new, |c| format!("\n{c}\n"));
     Mail {
         to: issue.reporter_email.clone(),
         subject: format!("[{key}] {}: {status}", issue.title),
-        body: format!("Your report {key} \"{}\" is now: {status}.{duplicate}\n", issue.title),
+        body: format!("Your report {key} \"{}\" is now: {status}.{duplicate}\n{comment}", issue.title),
     }
 }
 

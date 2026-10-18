@@ -46,6 +46,7 @@ that reads everything it offers from PMO. The reference implementation is dobre-
 | `GET /reports/options` | `GET /v1/projects/{key}` | Return `{issue_types, platforms}`. Cache for a few minutes. |
 | `GET /reports?status=open\|closed&q=&limit=&offset=` | `GET /v1/projects/{key}/issues` with the same query | `q` is a typo-tolerant search sorted by relevance. Drop issues whose type isn't in the options (e.g. the admins' `todo`s are internal). Pass `next_offset` through. |
 | `POST /reports` (multipart: `type`, `title`, `description?`, `platform?`, `files[]`) | `POST /v1/projects/{key}/issues`, then `POST /v1/issues/{issueKey}/attachments` per file | Uploading in the same request means the app needn't track who owns which issue. If a file fails, still return the created report and say which files failed. |
+| `GET /reports/{key}/comments` (optional) | `GET /v1/issues/{key}/comments` | Public comments, e.g. why a report won't be fixed. Show them under the report. Internal comments never reach apps. |
 | `GET /reports/attachments/{id}` (optional) | `GET /v1/attachments/{id}` | Stream it through, passing `Range` for videos. Only if the page shows attachments. |
 
 - Send `Authorization: Bearer ${PMO_API_KEY}` and a timeout (about 10 s; uploads longer) on every call.
@@ -97,5 +98,6 @@ GET  /v1/projects/DM/issues?status=open&q=map → {items:[Issue], next_offset}
 POST /v1/projects/DM/issues                   {type, title, description, platform, reporter:{email,name}} → Issue
 POST /v1/issues/DM-12/attachments             multipart "file" → Attachment {id, url, kind, content_type, size}
 GET  /v1/attachments/{id}                     → the file (Range supported)
+GET  /v1/issues/DM-12/comments                → public comments [{body, author:{kind,name}, created_at}]
 GET  /v1/issues/DM-12/events                  → history: who changed what, when
 ```
