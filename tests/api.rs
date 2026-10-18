@@ -832,6 +832,9 @@ async fn comments(db: PgPool) {
     let (s, _) = app.post("/v1/issues/DM-1/comments", &ola, json!({ "body": "x", "internal": true })).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
 
+    let (_, issue) = app.get("/v1/issues/DM-1", &app_key).await;
+    assert_eq!(issue["comment_count"], 1, "internal comments aren't counted");
+
     // Whoever sees the issue sees its public comments, apps included.
     for key in [&ola, &kuba, &app_key] {
         let (_, list) = app.get("/v1/issues/DM-1/comments", key).await;

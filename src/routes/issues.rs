@@ -44,6 +44,8 @@ pub struct Issue {
     pub duplicate_of: Option<String>,
     /// Name of the app the issue was reported through.
     pub source_app: Option<String>,
+    /// Public comments (internal ones are not counted).
+    pub comment_count: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -85,6 +87,7 @@ pub(super) struct IssueRow {
     duplicate_of_id: Option<Uuid>,
     duplicate_of: Option<String>,
     source_app: Option<String>,
+    comment_count: i64,
     pub(super) source_app_id: Option<Uuid>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -125,6 +128,7 @@ impl IssueRow {
             milestone: self.milestone_id.zip(self.milestone_name).map(|(id, name)| MilestoneRef { id, name }),
             duplicate_of: self.duplicate_of,
             source_app: self.source_app,
+            comment_count: self.comment_count,
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -134,7 +138,8 @@ impl IssueRow {
 const SELECT: &str = "SELECT i.id, i.project_id, p.key AS project, i.number, i.type AS issue_type, i.priority,
     i.status, i.title, i.description, i.private, i.platform, p.platforms AS project_platforms, i.reporter_id, u.name AS reporter_name, u.email AS reporter_email,
     i.milestone_id, m.name AS milestone_name, i.duplicate_of_id, dp.key || '-' || d.number AS duplicate_of,
-    a.name AS source_app, i.source_app_id, i.created_at, i.updated_at
+    a.name AS source_app, i.source_app_id, i.created_at, i.updated_at,
+    (SELECT count(*) FROM issue_comments c WHERE c.issue_id = i.id AND NOT c.internal) AS comment_count
     FROM issues i
     JOIN projects p ON p.id = i.project_id
     JOIN users u ON u.id = i.reporter_id
