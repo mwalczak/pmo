@@ -819,6 +819,7 @@ async fn comments(db: PgPool) {
     let close = json!({ "status": "wont_fix", "comment": "The map tiles have no dark style yet." });
     let (s, issue) = app.patch("/v1/issues/DM-1", &admin, close).await;
     assert_eq!((s, &issue["status"]), (StatusCode::OK, &json!("wont_fix")));
+    assert_eq!(issue["comment_count"], 1);
     let mails = app.take_mails();
     assert_eq!(mails.len(), 1);
     assert!(mails[0].subject.ends_with("wont fix"));

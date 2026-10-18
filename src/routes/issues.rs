@@ -650,9 +650,13 @@ pub async fn update(
     }
     let comment_internal = body.comment_internal.unwrap_or(false);
     let comment = body.comment.as_deref().filter(|c| !c.trim().is_empty());
-    if let Some(text) = comment {
-        super::comments::add(&mut tx, &principal, &updated, text, comment_internal).await?;
-    }
+    let updated = match comment {
+        Some(text) => {
+            super::comments::add(&mut tx, &principal, &updated, text, comment_internal).await?;
+            fetch_by_id(&mut *tx, current.id).await? // with the comment counted
+        }
+        None => updated,
+    };
     tx.commit().await?;
     let public_comment = comment.filter(|_| !comment_internal).map(str::trim);
     if status != current.status && !is_reporter {
