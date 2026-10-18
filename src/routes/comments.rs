@@ -204,7 +204,7 @@ pub async fn create(
     tx.commit().await?;
     let by_reporter = principal.user().is_some_and(|u| u.id == issue.reporter_id);
     if !internal && !by_reporter {
-        let settings = Settings::load(&state.db, issue.project_id).await?;
+        let settings = Settings::load(&state.db, issue.project_id, state.secrets.as_deref()).await?;
         if settings.notify_comments {
             state.mailer.send(settings.comment_mail(&issue.mail_info(), &row.body, row.author_name.as_deref()));
         }

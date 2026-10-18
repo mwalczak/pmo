@@ -8,6 +8,7 @@ pub mod models;
 pub mod notify;
 pub mod ratelimit;
 pub mod routes;
+pub mod secretbox;
 pub mod storage;
 
 use std::sync::Arc;
@@ -28,6 +29,8 @@ pub struct AppState {
     pub storage: Arc<storage::Storage>,
     /// Requests per key per minute.
     pub rate_limiter: Arc<ratelimit::RateLimiter>,
+    /// Encrypts the secrets kept in the database (projects' SMTP passwords); `None` without MAIL_ENCRYPTION_KEY.
+    pub secrets: Option<Arc<secretbox::SecretBox>>,
 }
 
 /// Makes the configured e-mails admins, creating their users if needed. An admin who never had a key gets one

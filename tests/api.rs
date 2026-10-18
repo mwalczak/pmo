@@ -31,6 +31,11 @@ impl TestApp {
     }
 
     fn with_rate_limit(db: PgPool, per_minute: u32) -> Self {
+        let secrets = pmo::secretbox::SecretBox::from_hex(&"ab".repeat(32)).expect("a valid test key");
+        Self::build(db, per_minute, Some(Arc::new(secrets)))
+    }
+
+    fn build(db: PgPool, per_minute: u32, secrets: Option<Arc<pmo::secretbox::SecretBox>>) -> Self {
         let mails = Arc::new(Mutex::new(Vec::new()));
         let state = AppState {
             db,
@@ -41,6 +46,7 @@ impl TestApp {
                 4 * 1024 * 1024,
             )),
             rate_limiter: Arc::new(pmo::ratelimit::RateLimiter::new(per_minute)),
+            secrets,
         };
         Self { router: pmo::app(state.clone()), state, mails }
     }
@@ -897,7 +903,6 @@ async fn comments(db: PgPool) {
 async fn project_notifications(db: PgPool) {
     let app = TestApp::new(db);
     let (admin, _) = app.setup().await;
-    // Its own project key: the password variable set below is process-wide.
     app.post("/v1/projects", &admin, json!({ "key": "NT", "name": "Dobre Mleko" })).await;
     let (_, created) = app.post("/v1/apps", &admin, json!({ "name": "nt.app", "projects": ["NT"] })).await;
     let app_key = created["key"]["key"].as_str().unwrap().to_owned();
@@ -925,8 +930,8 @@ async fn project_notifications(db: PgPool) {
     let put = |body: Value| app.call(Method::PUT, "/v1/projects/NT/notifications", Some(&admin), Some(body));
     let (s, saved) = put(settings.clone()).await;
     assert_eq!(s, StatusCode::OK, "{saved}");
-    assert_eq!(saved["mail"]["password_variable"], "SMTP_PASSWORD_NT");
     assert_eq!(saved["mail"]["password_set"], false);
+    assert!(saved["mail"].get("smtp_password").is_none(), "never returned");
     for bad in [json!({ "language": "de" }), json!({ "mail": { "from": "not an address" } })] {
         let mut body = settings.clone();
         for (k, v) in bad.as_object().unwrap() {
@@ -959,19 +964,37 @@ async fn project_notifications(db: PgPool) {
     assert!(mails[0].body.contains("Mapa wymaga dostępu do lokalizacji."));
     assert!(mails[0].sender.is_none(), "no password yet: the server's sender");
 
-    // With the password set, the project's own server and address send.
-    unsafe { std::env::set_var("SMTP_PASSWORD_NT", "secret") };
-    let (_, now) = app.get("/v1/projects/NT/notifications", &admin).await;
-    assert_eq!(now["mail"]["password_set"], true);
+    // With the password stored (encrypted), the project's own server and address send.
+    let mut with_password = settings.clone();
+    with_password["mail"]["smtp_password"] = json!("tajne-hasło");
+    let (s, saved) = put(with_password).await;
+    assert_eq!((s, &saved["mail"]["password_set"]), (StatusCode::OK, &json!(true)));
+    assert!(!saved.to_string().contains("tajne"));
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT smtp_password FROM project_notifications").fetch_one(&app.state.db).await.unwrap();
+    assert!(!String::from_utf8_lossy(&stored).contains("tajne"), "stored encrypted");
+    // Saving again without a password keeps it.
+    let (_, saved) = put(settings.clone()).await;
+    assert_eq!(saved["mail"]["password_set"], true);
     app.patch("/v1/issues/NT-1", &admin, json!({ "status": "done" })).await;
     let mails = app.take_mails();
     let sender = mails[0].sender.as_ref().expect("the project's sender");
     assert_eq!(sender.from, "Dobre Mleko <kontakt@dobre-mleko.app>");
     assert!(matches!(&sender.smtp, Smtp::Server { host, port: 465, username, password }
-        if host == "ssl0.ovh.net" && username == "kontakt@dobre-mleko.app" && password == "secret"));
+        if host == "ssl0.ovh.net" && username == "kontakt@dobre-mleko.app" && password == "tajne-hasło"));
 
     // Logged, without any password.
     let (_, log) = app.get("/v1/events?action=project.notifications_updated", &admin).await;
-    assert_eq!(log["items"][0]["changes"]["language"], json!({ "from": "en", "to": "pl" }));
-    assert!(!log.to_string().contains("secret"));
+    let first = log["items"].as_array().unwrap().last().unwrap();
+    assert_eq!(first["changes"]["language"], json!({ "from": "en", "to": "pl" }));
+    assert!(!log.to_string().contains("tajne"));
+
+    // Without MAIL_ENCRYPTION_KEY, no password can be stored.
+    let bare = TestApp::build(app.state.db.clone(), 0, None);
+    let req = |body: Value| bare.call(Method::PUT, "/v1/projects/NT/notifications", Some(&admin), Some(body));
+    let mut with_password = settings.clone();
+    with_password["mail"]["smtp_password"] = json!("x");
+    let (s, body) = req(with_password).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(body["message"].as_str().unwrap().contains("MAIL_ENCRYPTION_KEY"));
 }

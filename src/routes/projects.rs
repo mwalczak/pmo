@@ -293,14 +293,14 @@ pub async fn get_notifications(
 ) -> ApiResult<Json<NotificationSettings>> {
     principal.require_admin()?;
     let project = load(&state, &principal, &key).await?;
-    Ok(Json(NotificationSettings::from(&Settings::load(&state.db, project.id).await?)))
+    Ok(Json(NotificationSettings::from(&Settings::load(&state.db, project.id, state.secrets.as_deref()).await?)))
 }
 
 /// Set a project's notification settings.
 ///
-/// Replaces them all. With `mail`, e-mails go through the project's own SMTP server from its own address; the
-/// password is read from the `SMTP_PASSWORD_<KEY>` environment variable (a deploy secret), never stored. Until it is
-/// set, the server's sender is used. Admin only.
+/// Replaces them all. With `mail`, e-mails go through the project's own SMTP server from its own address. Its
+/// `smtp_password` is stored encrypted (MAIL_ENCRYPTION_KEY) and never returned; leave it out to keep the stored
+/// one, and `mail: null` removes it. Until a password is stored, the server's sender is used. Admin only.
 #[utoipa::path(
     put, operation_id = "setProjectNotifications", path = "/v1/projects/{key}/notifications", tag = "projects",
     params(("key" = String, Path, example = "DM")), request_body = NotificationSettings,
@@ -325,16 +325,30 @@ pub async fn set_notifications(
             return Err(ApiError::bad_request("mail needs smtp_host and smtp_username"));
         }
     }
-    let before = NotificationSettings::from(&Settings::load(&state.db, project.id).await?);
+    let before = NotificationSettings::from(&Settings::load(&state.db, project.id, state.secrets.as_deref()).await?);
     let statuses: Vec<&str> = body.statuses.iter().map(|s| s.as_str()).collect();
     let mail = body.mail.as_ref();
+    let new_password = mail.and_then(|m| m.smtp_password.as_deref()).filter(|p| !p.is_empty());
+    let sealed = match (new_password, state.secrets.as_deref()) {
+        (Some(password), Some(secrets)) => Some(secrets.seal(password, project.id.as_bytes())),
+        (Some(_), None) => {
+            return Err(ApiError::bad_request(
+                "MAIL_ENCRYPTION_KEY is not configured on the server, so no password can be stored",
+            ));
+        }
+        (None, _) => None,
+    };
+    // A new password replaces the stored one; without `mail` there is none; otherwise the stored one stays.
+    let replace_password = mail.is_none() || sealed.is_some();
     let mut tx = state.db.begin().await?;
     sqlx::query(
         "INSERT INTO project_notifications
-           (project_id, language, notify_statuses, notify_comments, mail_from, smtp_host, smtp_port, smtp_username)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           (project_id, language, notify_statuses, notify_comments, mail_from, smtp_host, smtp_port, smtp_username,
+            smtp_password)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (project_id) DO UPDATE SET language = $2, notify_statuses = $3, notify_comments = $4,
-           mail_from = $5, smtp_host = $6, smtp_port = $7, smtp_username = $8, updated_at = now()",
+           mail_from = $5, smtp_host = $6, smtp_port = $7, smtp_username = $8,
+           smtp_password = CASE WHEN $10 THEN $9 ELSE project_notifications.smtp_password END, updated_at = now()",
     )
     .bind(project.id)
     .bind(&body.language)
@@ -344,9 +358,11 @@ pub async fn set_notifications(
     .bind(mail.map(|m| m.smtp_host.trim()))
     .bind(mail.and_then(|m| m.smtp_port).map(i32::from))
     .bind(mail.map(|m| m.smtp_username.trim()))
+    .bind(&sealed)
+    .bind(replace_password)
     .execute(&mut *tx)
     .await?;
-    let after = NotificationSettings::from(&Settings::load(&mut *tx, project.id).await?);
+    let after = NotificationSettings::from(&Settings::load(&mut *tx, project.id, state.secrets.as_deref()).await?);
     let as_json = |s: &NotificationSettings| serde_json::to_value(s).expect("serializes");
     let (old, new) = (as_json(&before), as_json(&after));
     let mut diff = Diff::default();

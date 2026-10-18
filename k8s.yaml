@@ -108,12 +108,12 @@ spec:
             # Empty: PMO <SMTP_USERNAME>.
             - name: MAIL_FROM
               valueFrom: { secretKeyRef: { name: pmo, key: MAIL_FROM } }
+            # Encrypts projects' SMTP passwords in the database; empty: no project can have its own sender.
+            - name: MAIL_ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: pmo, key: MAIL_ENCRYPTION_KEY } }
             - { name: STORAGE_DIR, value: /data/attachments }
             # Unique per workflow run, so re-running the deploy after changing secrets restarts the pod.
             - { name: DEPLOY_ID, value: DEPLOY_ID_PLACEHOLDER }
-          # Projects' own SMTP passwords (SMTP_PASSWORD_<KEY>), from the repository secrets of that name.
-          envFrom:
-            - secretRef: { name: pmo-project-mail, optional: true }
           volumeMounts:
             - { name: attachments, mountPath: /data/attachments }
           ports:

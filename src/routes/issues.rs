@@ -489,7 +489,7 @@ pub async fn create(
             Principal::App(a) => Some(a.name.as_str()),
             Principal::User(_) => None,
         };
-        let settings = Settings::load(&state.db, project.id).await?;
+        let settings = Settings::load(&state.db, project.id, state.secrets.as_deref()).await?;
         state.mailer.send(settings.welcome_mail(state.public_url.as_deref(), &email, name.as_deref(), &key, via));
     }
     Ok((StatusCode::CREATED, Json(created.into_issue(&principal))))
@@ -664,7 +664,7 @@ pub async fn update(
     // The reporter hears about the changes their project notifies about (not about their own).
     let public_comment = comment.filter(|_| !comment_internal).map(str::trim);
     if !is_reporter {
-        let settings = Settings::load(&state.db, updated.project_id).await?;
+        let settings = Settings::load(&state.db, updated.project_id, state.secrets.as_deref()).await?;
         if status != current.status && settings.notifies_status(status) {
             let duplicate_of = updated.duplicate_of.as_deref();
             state.mailer.send(settings.status_mail(&updated.mail_info(), status, duplicate_of, public_comment));

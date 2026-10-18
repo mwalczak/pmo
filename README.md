@@ -22,7 +22,7 @@ Rust · Axum · SQLx · Postgres 17 (`pg_trgm` for typo-tolerant search) · a 15
 | **Milestones** | Belong to a project; `open`/`closed`, optional due date. A project has **at most one open milestone**, and every new issue goes into it automatically (admins can pick another). To start the next one, close the current one first. |
 | **Issues** | `type` bug/idea/abuse/todo · `priority` P1–P5 (default P3, set by admins) · `status` reported → accepted → in_progress → in_review → waiting_for_release → done, or wont_fix / duplicate (with `duplicate_of`); the first five are "open" · `platform`, one of the project's. |
 | **Comments** | On issues: anyone who sees the issue reads its public comments and can add one; admins can also write `internal` ones (admins only). A status change can carry a comment (`PATCH /v1/issues/{key}` with `comment`), e.g. why an issue won't be fixed; the reporter's status e-mail includes it, and they are e-mailed about other people's public comments too. |
-| **Notifications** | Per project (`GET/PUT /v1/projects/{key}/notifications`, admin): the language of e-mails to reporters (`en`, `pl`), which status changes they are e-mailed about (a comment given with the change is included), whether comments are e-mailed, and optionally the project's own sender (`From` and SMTP server). The password comes from a deploy secret `SMTP_PASSWORD_<KEY>`; until it is set, the server's sender is used. |
+| **Notifications** | Per project (`GET/PUT /v1/projects/{key}/notifications`, admin): the language of e-mails to reporters (`en`, `pl`), which status changes they are e-mailed about (a comment given with the change is included), whether comments are e-mailed, and optionally the project's own sender (`From`, SMTP server and password). The password is stored encrypted with `MAIL_ENCRYPTION_KEY` and never returned; until one is stored, the server's sender is used. |
 | **Attachments** | Screenshots and recordings on issues: images (PNG, JPEG, GIF, WebP, HEIC, AVIF) and videos (MP4, MOV, WebM), the type detected from the contents, up to `MAX_UPLOAD_MB` each and 20 per issue. Stored on a volume under their SHA-256. Visible to whoever sees the issue; downloads support `Range`. |
 | **Action log** | Every change is logged: who (user, app or `system`), what (`issue.updated`, `attachment.added`, `key.revoked`, …), when, and the changed fields as `{"from", "to"}`. It outlives what it describes. |
 
@@ -100,6 +100,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings
 | `MAIL_FROM` | Default `PMO <SMTP_USERNAME>` |
 | `STORAGE_DIR` | Attachment files, default `./data/attachments` (a volume in production) |
 | `MAX_UPLOAD_MB` | Largest attachment, default `100` |
+| `MAIL_ENCRYPTION_KEY` | 64 hex characters (`openssl rand -hex 32`); encrypts projects' SMTP passwords in the database. Without it, projects cannot have their own sender. Changing it makes stored passwords unreadable: set them again |
 | `RATE_LIMIT_PER_MINUTE` | Requests per key per minute (bursts up to it, refilled evenly), default `600`; `0` turns it off. Beyond it: 429 with `Retry-After` |
 
 Without SMTP, e-mails are only logged; their bodies (which can contain keys) appear only at `RUST_LOG=debug`.
@@ -128,6 +129,7 @@ Repository settings → Secrets and variables → Actions:
 | `POSTGRES_PASSWORD` | e.g. `openssl rand -hex 24`. It is set when the database is first created, so don't change it later. |
 | `ADMIN_EMAILS` | Your e-mail (kept as a secret so it stays out of this public repository) |
 | `SMTP_PASSWORD` | Gmail app password. Empty turns e-mail off. |
+| `MAIL_ENCRYPTION_KEY` | `openssl rand -hex 32`; encrypts projects' SMTP passwords. Keep it: a new key makes stored passwords unreadable |
 
 | Variable | |
 |---|---|
@@ -135,10 +137,10 @@ Repository settings → Secrets and variables → Actions:
 | `SMTP_USERNAME` | e.g. `you@gmail.com` |
 | `SMTP_HOST`, `MAIL_FROM` | Optional; default `smtp.gmail.com` and `PMO <SMTP_USERNAME>` |
 
-**A project's own sender** (e.g. Dobre Mleko from `kontakt@dobre-mleko.app` via OVH): add a repository secret
-`SMTP_PASSWORD_<KEY>` (e.g. `SMTP_PASSWORD_DM`) with that mailbox's password and re-run the deploy; every secret named
-like that reaches the API. Then `PUT /v1/projects/<KEY>/notifications` with `mail: {from, smtp_host, smtp_username}`.
-The domain's SPF must allow that server (OVH's own mailboxes do).
+**A project's own sender** (e.g. Dobre Mleko from `kontakt@dobre-mleko.app` via OVH): `PUT
+/v1/projects/<KEY>/notifications` with `mail: {from, smtp_host, smtp_username, smtp_password}`. The password is
+encrypted with `MAIL_ENCRYPTION_KEY` before it is stored. The domain's SPF must allow that server (OVH's own mailboxes
+do).
 
 The first deploy creates your admin account and e-mails you its key. Without e-mail, create one on the server:
 

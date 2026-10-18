@@ -52,6 +52,12 @@ async fn serve() -> Result<()> {
         public_url: config.public_url.clone(),
         storage: Arc::new(storage),
         rate_limiter: Arc::new(pmo::ratelimit::RateLimiter::new(config.rate_limit_per_minute)),
+        secrets: config
+            .mail_encryption_key
+            .as_deref()
+            .map(pmo::secretbox::SecretBox::from_hex)
+            .transpose()?
+            .map(Arc::new),
     };
     pmo::ensure_admins(&state, &config.admin_emails).await?;
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port)).await?;

@@ -16,6 +16,8 @@ pub struct Config {
     pub max_upload_bytes: u64,
     /// Requests per key per minute; 0 turns limiting off.
     pub rate_limit_per_minute: u32,
+    /// 64 hex characters; encrypts projects' SMTP passwords in the database.
+    pub mail_encryption_key: Option<String>,
 }
 
 impl Config {
@@ -36,6 +38,7 @@ impl Config {
                 .unwrap_or(100)
                 * 1024
                 * 1024,
+            mail_encryption_key: var("MAIL_ENCRYPTION_KEY"),
             rate_limit_per_minute: var("RATE_LIMIT_PER_MINUTE")
                 .map(|v| v.parse())
                 .transpose()

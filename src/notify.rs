@@ -8,11 +8,13 @@ use crate::{
     config::Smtp,
     mail::{Mail, Sender},
     models::IssueStatus,
+    secretbox::SecretBox,
 };
 
 /// A project's notification settings (`project_notifications`, or the defaults).
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct Settings {
+    pub project_id: Uuid,
     pub key: String,
     pub name: String,
     pub language: String,
@@ -22,32 +24,44 @@ pub struct Settings {
     pub smtp_host: Option<String>,
     pub smtp_port: Option<i32>,
     pub smtp_username: Option<String>,
+    /// Encrypted with MAIL_ENCRYPTION_KEY, bound to the project.
+    pub smtp_password: Option<Vec<u8>>,
+    /// The project's own sender, when its address, server, user and password are all set and the password opens.
+    #[sqlx(skip)]
+    pub sender: Option<Sender>,
 }
 
 impl Settings {
-    pub async fn load(db: impl PgExecutor<'_>, project_id: Uuid) -> sqlx::Result<Self> {
-        sqlx::query_as(
-            "SELECT p.key, p.name, coalesce(n.language, 'en') AS language,
+    pub async fn load(db: impl PgExecutor<'_>, project_id: Uuid, secrets: Option<&SecretBox>) -> sqlx::Result<Self> {
+        let mut settings: Self = sqlx::query_as(
+            "SELECT p.id AS project_id, p.key, p.name, coalesce(n.language, 'en') AS language,
                     coalesce(n.notify_statuses, $2) AS notify_statuses,
                     coalesce(n.notify_comments, true) AS notify_comments,
-                    n.mail_from, n.smtp_host, n.smtp_port, n.smtp_username
+                    n.mail_from, n.smtp_host, n.smtp_port, n.smtp_username, n.smtp_password
              FROM projects p LEFT JOIN project_notifications n ON n.project_id = p.id
              WHERE p.id = $1",
         )
         .bind(project_id)
         .bind(IssueStatus::ALL.map(|s| s.as_str().to_owned()).to_vec())
         .fetch_one(db)
-        .await
+        .await?;
+        settings.sender = settings.open_sender(secrets);
+        Ok(settings)
     }
 
-    /// The environment variable holding this project's SMTP password.
-    pub fn password_variable(&self) -> String {
-        format!("SMTP_PASSWORD_{}", self.key)
-    }
-
-    /// The project's own sender, when its address, server, user and password are all set.
-    pub fn sender(&self) -> Option<Sender> {
-        let password = std::env::var(self.password_variable()).ok().filter(|p| !p.trim().is_empty())?;
+    fn open_sender(&self, secrets: Option<&SecretBox>) -> Option<Sender> {
+        let sealed = self.smtp_password.as_deref()?;
+        let password = match secrets.map(|s| s.open(sealed, self.project_id.as_bytes())) {
+            Some(Ok(password)) => password,
+            Some(Err(e)) => {
+                tracing::error!(error = %e, project = %self.key, "project SMTP password does not open; using the default sender");
+                return None;
+            }
+            None => {
+                tracing::error!(project = %self.key, "MAIL_ENCRYPTION_KEY is not set; using the default sender");
+                return None;
+            }
+        };
         Some(Sender {
             from: self.mail_from.clone()?,
             smtp: Smtp::Server {
@@ -68,7 +82,7 @@ impl Settings {
     }
 
     fn mail(&self, to: &str, subject: String, body: String) -> Mail {
-        Mail { to: to.to_owned(), subject, body, sender: self.sender() }
+        Mail { to: to.to_owned(), subject, body, sender: self.sender.clone() }
     }
 
     /// The reporter's issue changed status; `comment` is the public comment that came with the change.
@@ -145,7 +159,7 @@ impl Settings {
     ) -> Mail {
         if !self.polish() {
             let mut mail = crate::mail::welcome_mail(public_url, email, name, key, via);
-            mail.sender = self.sender();
+            mail.sender = self.sender.clone();
             return mail;
         }
         let docs = public_url.map_or_else(String::new, |url| format!("\nDokumentacja API: {url}/docs\n"));
@@ -215,10 +229,10 @@ pub struct MailSettings {
     pub smtp_port: Option<u16>,
     #[schema(example = "kontakt@dobre-mleko.app")]
     pub smtp_username: String,
-    /// Read-only: the environment variable (a deploy secret) holding the password.
-    #[serde(default)]
-    pub password_variable: String,
-    /// Read-only: whether that variable is set. Until it is, the server's sender is used.
+    /// Write-only: stored encrypted (MAIL_ENCRYPTION_KEY), never returned. Leave it out to keep the current one.
+    #[serde(default, skip_serializing)]
+    pub smtp_password: Option<String>,
+    /// Read-only: whether a password is stored. Until one is, the server's sender is used.
     #[serde(default)]
     pub password_set: bool,
 }
@@ -231,8 +245,8 @@ impl From<&Settings> for NotificationSettings {
                 smtp_host,
                 smtp_port: s.smtp_port.map(|p| p as u16),
                 smtp_username,
-                password_variable: s.password_variable(),
-                password_set: std::env::var(s.password_variable()).is_ok_and(|p| !p.trim().is_empty()),
+                smtp_password: None,
+                password_set: s.smtp_password.is_some(),
             },
         );
         Self {
