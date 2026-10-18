@@ -78,6 +78,26 @@ pub struct CreateMilestone {
     pub name: String,
     pub description: Option<String>,
     pub due_on: Option<NaiveDate>,
+    /// Default `open`. A project has at most one open milestone: close the current one first.
+    pub state: Option<MilestoneState>,
+}
+
+/// The project's open milestone, which new issues go into.
+pub async fn open_in(db: impl sqlx::PgExecutor<'_>, project_id: Uuid) -> sqlx::Result<Option<(Uuid, String)>> {
+    sqlx::query_as("SELECT id, name FROM milestones WHERE project_id = $1 AND state = 'open'")
+        .bind(project_id)
+        .fetch_optional(db)
+        .await
+}
+
+/// Refuses to open a second milestone in a project (the database enforces it too).
+async fn ensure_none_open(state: &AppState, project_id: Uuid, except: Option<Uuid>) -> ApiResult<()> {
+    match open_in(&state.db, project_id).await? {
+        Some((id, name)) if Some(id) != except => Err(ApiError::conflict(format!(
+            "milestone {name:?} is open; a project has one open milestone at a time, so close it first"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Create a milestone.
@@ -95,20 +115,29 @@ pub async fn create(
     principal.require_admin()?;
     let project = projects::load(&state, &principal, &key).await?;
     let name = non_blank(Some(body.name)).ok_or_else(|| ApiError::bad_request("name is required"))?;
+    let milestone_state = body.state.unwrap_or(MilestoneState::Open);
+    if milestone_state == MilestoneState::Open {
+        ensure_none_open(&state, project.id, None).await?;
+    }
     let id = Uuid::now_v7();
     let description = non_blank(body.description);
     let mut tx = state.db.begin().await?;
-    sqlx::query("INSERT INTO milestones (id, project_id, name, description, due_on) VALUES ($1, $2, $3, $4, $5)")
-        .bind(id)
-        .bind(project.id)
-        .bind(&name)
-        .bind(&description)
-        .bind(body.due_on)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "INSERT INTO milestones (id, project_id, name, description, due_on, state) VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(project.id)
+    .bind(&name)
+    .bind(&description)
+    .bind(body.due_on)
+    .bind(milestone_state)
+    .execute(&mut *tx)
+    .await?;
     Event::new("milestone.created", "milestone", id)
         .project(project.id)
-        .changes(serde_json::json!({ "name": name, "description": description, "due_on": body.due_on }))
+        .changes(serde_json::json!({
+            "name": name, "description": description, "due_on": body.due_on, "state": milestone_state,
+        }))
         .record(&mut *tx, (&principal).into())
         .await?;
     tx.commit().await?;
@@ -160,6 +189,9 @@ pub async fn update(
     let description = body.description.map_or_else(|| current.description.clone(), |d| non_blank(Some(d)));
     let due_on = body.due_on.unwrap_or(current.due_on);
     let milestone_state = body.state.unwrap_or(current.state);
+    if milestone_state == MilestoneState::Open {
+        ensure_none_open(&state, current.project_id, Some(id)).await?;
+    }
     let mut tx = state.db.begin().await?;
     sqlx::query(
         "UPDATE milestones SET name = $2, description = $3, due_on = $4, state = $5, updated_at = now() WHERE id = $1",

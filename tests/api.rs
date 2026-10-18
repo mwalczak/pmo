@@ -366,6 +366,8 @@ async fn milestones(db: PgPool) {
     app.post("/v1/projects/DM/issues", &admin, json!({ "type": "idea", "title": "B" })).await;
     let (_, issue) = app.get("/v1/issues/DM-1", &admin).await;
     assert_eq!(issue["milestone"], json!({ "id": id, "name": "v1.0" }));
+    // B went into the open milestone too; taken out, it is no longer listed under it.
+    app.patch("/v1/issues/DM-2", &admin, json!({ "milestone_id": null })).await;
     let (_, page) = app.get(&format!("/v1/projects/DM/issues?milestone_id={id}"), &app_key).await;
     assert_eq!(keys(&page), ["DM-1"]);
 
@@ -757,4 +759,49 @@ async fn review_and_release_statuses(db: PgPool) {
     assert_eq!(keys(&page), ["DM-1"]);
     let (_, page) = app.get("/v1/projects/DM/issues?status=closed", &admin).await;
     assert!(keys(&page).is_empty());
+}
+
+#[sqlx::test]
+async fn new_issues_go_into_the_open_milestone(db: PgPool) {
+    let app = TestApp::new(db);
+    let (admin, app_key) = app.setup().await;
+    let report = || json!({ "type": "bug", "title": "x", "reporter": { "email": "ola@example.com" } });
+
+    // Without an open milestone, issues have none.
+    let (_, issue) = app.post("/v1/projects/DM/issues", &app_key, report()).await;
+    assert_eq!(issue["milestone"], Value::Null);
+
+    let (_, beta) = app.post("/v1/projects/DM/milestones", &admin, json!({ "name": "Beta" })).await;
+    let beta_id = beta["id"].as_str().unwrap().to_owned();
+    // One open milestone per project, whether created or reopened.
+    let (s, body) = app.post("/v1/projects/DM/milestones", &admin, json!({ "name": "1.0" })).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert!(body["message"].as_str().unwrap().contains("\"Beta\" is open"));
+    let (s, later) = app.post("/v1/projects/DM/milestones", &admin, json!({ "name": "1.0", "state": "closed" })).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let later_id = later["id"].as_str().unwrap().to_owned();
+    let (s, _) = app.patch(&format!("/v1/milestones/{later_id}"), &admin, json!({ "state": "open" })).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    // Other projects have their own.
+    app.post("/v1/projects", &admin, json!({ "key": "XX", "name": "Other" })).await;
+    let (s, _) = app.post("/v1/projects/XX/milestones", &admin, json!({ "name": "Beta" })).await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    // Reported issues (by apps, users, admins) go into the open milestone; admins can pick another.
+    let (_, issue) = app.post("/v1/projects/DM/issues", &app_key, report()).await;
+    assert_eq!(issue["milestone"], json!({ "id": beta_id, "name": "Beta" }));
+    let (_, todo) = app.post("/v1/projects/DM/issues", &admin, json!({ "type": "todo", "title": "y" })).await;
+    assert_eq!(todo["milestone"]["name"], "Beta");
+    let picked = json!({ "type": "todo", "title": "z", "milestone_id": later_id });
+    let (_, issue) = app.post("/v1/projects/DM/issues", &admin, picked).await;
+    assert_eq!(issue["milestone"]["name"], "1.0");
+
+    // Closing it stops that; then the other can be opened and takes over.
+    app.patch(&format!("/v1/milestones/{beta_id}"), &admin, json!({ "state": "closed" })).await;
+    let (_, issue) = app.post("/v1/projects/DM/issues", &app_key, report()).await;
+    assert_eq!(issue["milestone"], Value::Null);
+    let (s, _) = app.patch(&format!("/v1/milestones/{later_id}"), &admin, json!({ "state": "open" })).await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, issue) = app.post("/v1/projects/DM/issues", &app_key, report()).await;
+    assert_eq!(issue["milestone"]["name"], "1.0");
 }

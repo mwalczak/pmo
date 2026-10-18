@@ -42,7 +42,7 @@ Building an app's report page? Agents: read `/skills/pmo-thin-client/SKILL.md`."
     tags(
         (name = "me", description = "The caller and their keys"),
         (name = "projects", description = "Projects group milestones and issues; their key prefixes issue keys"),
-        (name = "milestones", description = "Planned releases or goals within a project"),
+        (name = "milestones", description = "Planned releases or goals within a project. At most one is open at a time, and new issues go into it"),
         (name = "issues", description = "Bugs, ideas, abuse reports and things to do"),
         (name = "attachments", description = "Screenshots and recordings on issues"),
         (name = "events", description = "The action log: who did what, when, and what changed"),

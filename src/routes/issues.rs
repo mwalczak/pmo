@@ -334,7 +334,7 @@ pub struct CreateIssue {
     pub description: Option<String>,
     /// Admins only. Default `P3`.
     pub priority: Option<Priority>,
-    /// Admins only.
+    /// Admins only. Default: the project's open milestone, if any.
     pub milestone_id: Option<Uuid>,
     /// Default `false`; abuse reports are always created private.
     pub private: Option<bool>,
@@ -406,6 +406,11 @@ pub async fn create(
     }
 
     let mut tx = state.db.begin().await?;
+    // New issues go into the project's open milestone, unless an admin picked one.
+    let milestone_id = match body.milestone_id {
+        Some(id) => Some(id),
+        None => milestones::open_in(&mut *tx, project.id).await?.map(|(id, _)| id),
+    };
     let (reporter_id, new_key) = match (&principal, body.reporter) {
         (Principal::App(_), None) => return Err(ApiError::bad_request("apps must pass reporter.email")),
         (Principal::User(u), None) => (u.id, None),
@@ -440,7 +445,7 @@ pub async fn create(
     .bind(description)
     .bind(body.issue_type == IssueType::Abuse || body.private.unwrap_or(false))
     .bind(reporter_id)
-    .bind(body.milestone_id)
+    .bind(milestone_id)
     .bind(principal.app_id())
     .bind(platform)
     .execute(&mut *tx)
