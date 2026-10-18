@@ -21,8 +21,9 @@ that reads everything it offers from PMO. The reference implementation is dobre-
    an account for a new reporter and e-mails them a personal key, then e-mails them status changes.
 3. **Nothing about the form is hardcoded.** Issue types (with labels in the project's language) and platforms come
    from `GET /v1/projects/{key}` → `issue_types: [{id, label}]`, `platforms: [{id, label}]`. Show the labels as they
-   are. Statuses are a fixed set (`reported`, `accepted`, `in_progress`, `done`, `wont_fix`, `duplicate`); translate
-   those in the app.
+   are. Statuses (`reported`, `accepted`, `in_progress`, `in_review`, `waiting_for_release`, `done`, `wont_fix`,
+   `duplicate`) are translated in the app. Keep a fallback for statuses the app doesn't know, and don't validate them
+   against a fixed list, so a status PMO adds later can't break the app.
 4. **Abuse reports are private.** PMO never lists them to apps. Don't offer "similar reports" for them, and tell
    the user only admins will see the report.
 5. **Fail soft.** Without configuration, or when PMO is down, the proxy answers 503 (`reports_unavailable`) and the

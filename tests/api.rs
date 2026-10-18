@@ -735,3 +735,26 @@ async fn app_keys_are_refused_from_browsers(db: PgPool) {
     assert_eq!(app.get("/v1/projects/DM/issues", &app_key).await.0, StatusCode::OK);
     assert_eq!(app.router.clone().oneshot(from_page(&admin)).await.unwrap().status(), StatusCode::OK);
 }
+
+#[sqlx::test]
+async fn review_and_release_statuses(db: PgPool) {
+    let app = TestApp::new(db);
+    let (admin, app_key) = app.setup().await;
+    let report = json!({ "type": "bug", "title": "Crash", "reporter": { "email": "ola@example.com" } });
+    app.post("/v1/projects/DM/issues", &app_key, report).await;
+    app.take_mails();
+
+    for (status, words) in [("in_review", "in review"), ("waiting_for_release", "waiting for release")] {
+        let (s, issue) = app.patch("/v1/issues/DM-1", &admin, json!({ "status": status })).await;
+        assert_eq!((s, &issue["status"]), (StatusCode::OK, &json!(status)));
+        // Still open, for lists like "already reported".
+        let (_, page) = app.get("/v1/projects/DM/issues?status=open", &app_key).await;
+        assert_eq!(keys(&page), ["DM-1"]);
+        let mails = app.take_mails();
+        assert_eq!(mails[0].subject, format!("[DM-1] Crash: {words}"));
+    }
+    let (_, page) = app.get("/v1/projects/DM/issues?status=in_review,waiting_for_release", &admin).await;
+    assert_eq!(keys(&page), ["DM-1"]);
+    let (_, page) = app.get("/v1/projects/DM/issues?status=closed", &admin).await;
+    assert!(keys(&page).is_empty());
+}

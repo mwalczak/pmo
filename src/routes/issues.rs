@@ -199,7 +199,8 @@ pub enum IssueSort {
 #[derive(Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ListIssues {
-    /// Comma-separated statuses, or `open` (reported, accepted, in_progress) or `closed` (done, wont_fix, duplicate).
+    /// Comma-separated statuses, or `open` (reported, accepted, in_progress, in_review, waiting_for_release) or
+    /// `closed` (done, wont_fix, duplicate).
     #[param(example = "open")]
     pub status: Option<String>,
     #[serde(rename = "type")]

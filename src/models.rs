@@ -54,6 +54,10 @@ pub enum IssueStatus {
     Reported,
     Accepted,
     InProgress,
+    /// Done, being reviewed (e.g. a pull request).
+    InReview,
+    /// Done and approved, not released yet.
+    WaitingForRelease,
     Done,
     WontFix,
     /// Set together with `duplicate_of`.
@@ -61,9 +65,18 @@ pub enum IssueStatus {
 }
 
 impl IssueStatus {
-    pub const ALL: [Self; 6] =
-        [Self::Reported, Self::Accepted, Self::InProgress, Self::Done, Self::WontFix, Self::Duplicate];
-    pub const OPEN: [Self; 3] = [Self::Reported, Self::Accepted, Self::InProgress];
+    pub const ALL: [Self; 8] = [
+        Self::Reported,
+        Self::Accepted,
+        Self::InProgress,
+        Self::InReview,
+        Self::WaitingForRelease,
+        Self::Done,
+        Self::WontFix,
+        Self::Duplicate,
+    ];
+    pub const OPEN: [Self; 5] =
+        [Self::Reported, Self::Accepted, Self::InProgress, Self::InReview, Self::WaitingForRelease];
     pub const CLOSED: [Self; 3] = [Self::Done, Self::WontFix, Self::Duplicate];
 
     pub fn as_str(self) -> &'static str {
@@ -71,6 +84,8 @@ impl IssueStatus {
             Self::Reported => "reported",
             Self::Accepted => "accepted",
             Self::InProgress => "in_progress",
+            Self::InReview => "in_review",
+            Self::WaitingForRelease => "waiting_for_release",
             Self::Done => "done",
             Self::WontFix => "wont_fix",
             Self::Duplicate => "duplicate",
