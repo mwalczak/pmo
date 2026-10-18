@@ -9,6 +9,7 @@ use http_body_util::BodyExt;
 use pmo::{
     AppState,
     auth::{self, KeyOwner},
+    config::Smtp,
     events::Actor,
     mail::{Mail, Mailer},
     storage::Storage,
@@ -890,4 +891,87 @@ async fn comments(db: PgPool) {
     assert!(!history.to_string().contains("OpenFreeMap"));
     let (_, history) = app.get("/v1/issues/DM-1/events", &admin).await;
     assert!(history.to_string().contains("OpenFreeMap"));
+}
+
+#[sqlx::test]
+async fn project_notifications(db: PgPool) {
+    let app = TestApp::new(db);
+    let (admin, _) = app.setup().await;
+    // Its own project key: the password variable set below is process-wide.
+    app.post("/v1/projects", &admin, json!({ "key": "NT", "name": "Dobre Mleko" })).await;
+    let (_, created) = app.post("/v1/apps", &admin, json!({ "name": "nt.app", "projects": ["NT"] })).await;
+    let app_key = created["key"]["key"].as_str().unwrap().to_owned();
+
+    // Defaults: English, every status change and comment, the server's sender.
+    let (s, defaults) = app.get("/v1/projects/NT/notifications", &admin).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        (&defaults["language"], &defaults["comments"], &defaults["mail"]),
+        (&json!("en"), &json!(true), &Value::Null)
+    );
+    assert_eq!(defaults["statuses"].as_array().unwrap().len(), 8);
+    assert_eq!(app.get("/v1/projects/NT/notifications", &app_key).await.0, StatusCode::FORBIDDEN);
+
+    let settings = json!({
+        "language": "pl",
+        "statuses": ["done", "wont_fix"],
+        "comments": false,
+        "mail": {
+            "from": "Dobre Mleko <kontakt@dobre-mleko.app>",
+            "smtp_host": "ssl0.ovh.net",
+            "smtp_username": "kontakt@dobre-mleko.app",
+        },
+    });
+    let put = |body: Value| app.call(Method::PUT, "/v1/projects/NT/notifications", Some(&admin), Some(body));
+    let (s, saved) = put(settings.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{saved}");
+    assert_eq!(saved["mail"]["password_variable"], "SMTP_PASSWORD_NT");
+    assert_eq!(saved["mail"]["password_set"], false);
+    for bad in [json!({ "language": "de" }), json!({ "mail": { "from": "not an address" } })] {
+        let mut body = settings.clone();
+        for (k, v) in bad.as_object().unwrap() {
+            body[k] = if k == "mail" {
+                json!({ "from": v["from"], "smtp_host": "h", "smtp_username": "u" })
+            } else {
+                v.clone()
+            };
+        }
+        assert_eq!(put(body).await.0, StatusCode::BAD_REQUEST);
+    }
+
+    // A first report: the welcome e-mail is in Polish.
+    let report = json!({ "type": "bug", "title": "Mapa", "reporter": { "email": "ola@example.com", "name": "Ola" } });
+    app.post("/v1/projects/NT/issues", &app_key, report).await;
+    let mails = app.take_mails();
+    assert!(mails[0].subject.starts_with("Twój klucz do zgłoszeń"), "{}", mails[0].subject);
+    assert!(mails[0].body.starts_with("Cześć Ola!"));
+
+    // Only done and won't fix are e-mailed, comments aren't.
+    app.patch("/v1/issues/NT-1", &admin, json!({ "status": "accepted", "comment": "Sprawdzamy." })).await;
+    app.post("/v1/issues/NT-1/comments", &admin, json!({ "body": "Nadal sprawdzamy." })).await;
+    assert!(app.take_mails().is_empty());
+    let close = json!({ "status": "wont_fix", "comment": "Mapa wymaga dostępu do lokalizacji." });
+    app.patch("/v1/issues/NT-1", &admin, close).await;
+    let mails = app.take_mails();
+    assert_eq!(mails.len(), 1);
+    assert_eq!(mails[0].subject, "[NT-1] Mapa: nie zrobimy");
+    assert!(mails[0].body.contains("Twoje zgłoszenie NT-1 „Mapa” ma nowy status: nie zrobimy."));
+    assert!(mails[0].body.contains("Mapa wymaga dostępu do lokalizacji."));
+    assert!(mails[0].sender.is_none(), "no password yet: the server's sender");
+
+    // With the password set, the project's own server and address send.
+    unsafe { std::env::set_var("SMTP_PASSWORD_NT", "secret") };
+    let (_, now) = app.get("/v1/projects/NT/notifications", &admin).await;
+    assert_eq!(now["mail"]["password_set"], true);
+    app.patch("/v1/issues/NT-1", &admin, json!({ "status": "done" })).await;
+    let mails = app.take_mails();
+    let sender = mails[0].sender.as_ref().expect("the project's sender");
+    assert_eq!(sender.from, "Dobre Mleko <kontakt@dobre-mleko.app>");
+    assert!(matches!(&sender.smtp, Smtp::Server { host, port: 465, username, password }
+        if host == "ssl0.ovh.net" && username == "kontakt@dobre-mleko.app" && password == "secret"));
+
+    // Logged, without any password.
+    let (_, log) = app.get("/v1/events?action=project.notifications_updated", &admin).await;
+    assert_eq!(log["items"][0]["changes"]["language"], json!({ "from": "en", "to": "pl" }));
+    assert!(!log.to_string().contains("secret"));
 }

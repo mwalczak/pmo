@@ -12,8 +12,8 @@ use crate::{
     error::{ApiError, ApiResult, ErrorBody},
     events::{Diff, Event},
     extract::{Json, Path},
-    mail::Mail,
     models::non_blank,
+    notify::Settings,
 };
 
 const MAX_BODY: usize = 10_000;
@@ -204,22 +204,12 @@ pub async fn create(
     tx.commit().await?;
     let by_reporter = principal.user().is_some_and(|u| u.id == issue.reporter_id);
     if !internal && !by_reporter {
-        state.mailer.send(comment_mail(&issue, &row.body, row.author_name.as_deref()));
+        let settings = Settings::load(&state.db, issue.project_id).await?;
+        if settings.notify_comments {
+            state.mailer.send(settings.comment_mail(&issue.mail_info(), &row.body, row.author_name.as_deref()));
+        }
     }
     Ok((StatusCode::CREATED, Json(row.into_comment())))
-}
-
-pub(super) fn comment_mail(issue: &IssueRow, body: &str, author: Option<&str>) -> Mail {
-    let key = issue.key();
-    Mail {
-        to: issue.reporter_email().to_owned(),
-        subject: format!("[{key}] {}: new comment", issue.title()),
-        body: format!(
-            "{} commented on your report {key} \"{}\":\n\n{body}\n",
-            author.unwrap_or("Someone"),
-            issue.title()
-        ),
-    }
 }
 
 #[derive(Deserialize, ToSchema)]

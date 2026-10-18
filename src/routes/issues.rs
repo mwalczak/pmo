@@ -12,8 +12,8 @@ use crate::{
     error::{ApiError, ApiResult, ErrorBody},
     events::{Actor, Diff, Event},
     extract::{Json, Path, Query},
-    mail::{Mail, welcome_mail},
     models::{IssueStatus, IssueType, Priority, double_option, non_blank, platform_name},
+    notify::{IssueMail, Settings},
 };
 
 const MAX_TITLE: usize = 200;
@@ -98,12 +98,14 @@ impl IssueRow {
         format!("{}-{}", self.project, self.number)
     }
 
-    pub(super) fn title(&self) -> &str {
-        &self.title
-    }
-
-    pub(super) fn reporter_email(&self) -> &str {
-        &self.reporter_email
+    /// What notifications to the reporter need.
+    pub(super) fn mail_info(&self) -> IssueMail {
+        IssueMail {
+            key: self.key(),
+            title: self.title.clone(),
+            reporter_email: self.reporter_email.clone(),
+            reporter_name: self.reporter_name.clone(),
+        }
     }
 
     fn into_issue(self, principal: &Principal) -> Issue {
@@ -487,7 +489,8 @@ pub async fn create(
             Principal::App(a) => Some(a.name.as_str()),
             Principal::User(_) => None,
         };
-        state.mailer.send(welcome_mail(state.public_url.as_deref(), &email, name.as_deref(), &key, via));
+        let settings = Settings::load(&state.db, project.id).await?;
+        state.mailer.send(settings.welcome_mail(state.public_url.as_deref(), &email, name.as_deref(), &key, via));
     }
     Ok((StatusCode::CREATED, Json(created.into_issue(&principal))))
 }
@@ -658,26 +661,19 @@ pub async fn update(
         None => updated,
     };
     tx.commit().await?;
+    // The reporter hears about the changes their project notifies about (not about their own).
     let public_comment = comment.filter(|_| !comment_internal).map(str::trim);
-    if status != current.status && !is_reporter {
-        state.mailer.send(status_mail(&updated, public_comment));
-    } else if let Some(text) = public_comment.filter(|_| !is_reporter) {
-        let author = principal.user().and_then(|u| u.name.clone());
-        state.mailer.send(super::comments::comment_mail(&updated, text, author.as_deref()));
+    if !is_reporter {
+        let settings = Settings::load(&state.db, updated.project_id).await?;
+        if status != current.status && settings.notifies_status(status) {
+            let duplicate_of = updated.duplicate_of.as_deref();
+            state.mailer.send(settings.status_mail(&updated.mail_info(), status, duplicate_of, public_comment));
+        } else if let Some(text) = public_comment.filter(|_| settings.notify_comments) {
+            let author = principal.user().and_then(|u| u.name.clone());
+            state.mailer.send(settings.comment_mail(&updated.mail_info(), text, author.as_deref()));
+        }
     }
     Ok(Json(updated.into_issue(&principal)))
-}
-
-fn status_mail(issue: &IssueRow, comment: Option<&str>) -> Mail {
-    let key = format!("{}-{}", issue.project, issue.number);
-    let status = issue.status.as_str().replace('_', " ");
-    let duplicate = issue.duplicate_of.as_ref().map_or_else(String::new, |d| format!(" It duplicates {d}."));
-    let comment = comment.map_or_else(String::new, |c| format!("\n{c}\n"));
-    Mail {
-        to: issue.reporter_email.clone(),
-        subject: format!("[{key}] {}: {status}", issue.title),
-        body: format!("Your report {key} \"{}\" is now: {status}.{duplicate}\n{comment}", issue.title),
-    }
 }
 
 /// Delete an issue.

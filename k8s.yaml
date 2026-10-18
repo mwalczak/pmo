@@ -111,6 +111,9 @@ spec:
             - { name: STORAGE_DIR, value: /data/attachments }
             # Unique per workflow run, so re-running the deploy after changing secrets restarts the pod.
             - { name: DEPLOY_ID, value: DEPLOY_ID_PLACEHOLDER }
+          # Projects' own SMTP passwords (SMTP_PASSWORD_<KEY>), from the repository secrets of that name.
+          envFrom:
+            - secretRef: { name: pmo-project-mail, optional: true }
           volumeMounts:
             - { name: attachments, mountPath: /data/attachments }
           ports:

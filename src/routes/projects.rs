@@ -12,6 +12,7 @@ use crate::{
     events::{Diff, Event},
     extract::{Json, Path},
     models::{IssueType, non_blank, platform_name},
+    notify::{NotificationSettings, Settings},
 };
 
 /// Something a project offers its reporters (a platform or an issue type), with the label apps show for it.
@@ -275,4 +276,90 @@ pub async fn update(
     }
     tx.commit().await?;
     Ok(Json(project))
+}
+
+/// Get a project's notification settings.
+///
+/// How reporters are e-mailed: the language, which status changes and whether comments, and the sender. Admin only.
+#[utoipa::path(
+    get, operation_id = "getProjectNotifications", path = "/v1/projects/{key}/notifications", tag = "projects",
+    params(("key" = String, Path, example = "DM")),
+    responses((status = 200, body = NotificationSettings), (status = 403, body = ErrorBody), (status = 404, body = ErrorBody))
+)]
+pub async fn get_notifications(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(key): Path<String>,
+) -> ApiResult<Json<NotificationSettings>> {
+    principal.require_admin()?;
+    let project = load(&state, &principal, &key).await?;
+    Ok(Json(NotificationSettings::from(&Settings::load(&state.db, project.id).await?)))
+}
+
+/// Set a project's notification settings.
+///
+/// Replaces them all. With `mail`, e-mails go through the project's own SMTP server from its own address; the
+/// password is read from the `SMTP_PASSWORD_<KEY>` environment variable (a deploy secret), never stored. Until it is
+/// set, the server's sender is used. Admin only.
+#[utoipa::path(
+    put, operation_id = "setProjectNotifications", path = "/v1/projects/{key}/notifications", tag = "projects",
+    params(("key" = String, Path, example = "DM")), request_body = NotificationSettings,
+    responses((status = 200, body = NotificationSettings), (status = 400, body = ErrorBody), (status = 403, body = ErrorBody))
+)]
+pub async fn set_notifications(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(key): Path<String>,
+    Json(body): Json<NotificationSettings>,
+) -> ApiResult<Json<NotificationSettings>> {
+    principal.require_admin()?;
+    let project = load(&state, &principal, &key).await?;
+    if !matches!(body.language.as_str(), "en" | "pl") {
+        return Err(ApiError::bad_request("language must be en or pl"));
+    }
+    if let Some(mail) = &body.mail {
+        mail.from
+            .parse::<lettre::message::Mailbox>()
+            .map_err(|_| ApiError::bad_request(format!("invalid from address {:?}", mail.from)))?;
+        if mail.smtp_host.trim().is_empty() || mail.smtp_username.trim().is_empty() {
+            return Err(ApiError::bad_request("mail needs smtp_host and smtp_username"));
+        }
+    }
+    let before = NotificationSettings::from(&Settings::load(&state.db, project.id).await?);
+    let statuses: Vec<&str> = body.statuses.iter().map(|s| s.as_str()).collect();
+    let mail = body.mail.as_ref();
+    let mut tx = state.db.begin().await?;
+    sqlx::query(
+        "INSERT INTO project_notifications
+           (project_id, language, notify_statuses, notify_comments, mail_from, smtp_host, smtp_port, smtp_username)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (project_id) DO UPDATE SET language = $2, notify_statuses = $3, notify_comments = $4,
+           mail_from = $5, smtp_host = $6, smtp_port = $7, smtp_username = $8, updated_at = now()",
+    )
+    .bind(project.id)
+    .bind(&body.language)
+    .bind(&statuses)
+    .bind(body.comments)
+    .bind(mail.map(|m| m.from.trim()))
+    .bind(mail.map(|m| m.smtp_host.trim()))
+    .bind(mail.and_then(|m| m.smtp_port).map(i32::from))
+    .bind(mail.map(|m| m.smtp_username.trim()))
+    .execute(&mut *tx)
+    .await?;
+    let after = NotificationSettings::from(&Settings::load(&mut *tx, project.id).await?);
+    let as_json = |s: &NotificationSettings| serde_json::to_value(s).expect("serializes");
+    let (old, new) = (as_json(&before), as_json(&after));
+    let mut diff = Diff::default();
+    for field in ["language", "statuses", "comments", "mail"] {
+        diff = diff.field(field, &old[field], &new[field]);
+    }
+    if !diff.is_empty() {
+        Event::new("project.notifications_updated", "project", project.id)
+            .project(project.id)
+            .changes(diff.into_value())
+            .record(&mut *tx, (&principal).into())
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(Json(after))
 }

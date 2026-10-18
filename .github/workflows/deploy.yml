@@ -62,6 +62,8 @@ jobs:
           SMTP_USERNAME: ${{ vars.SMTP_USERNAME }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           MAIL_FROM: ${{ vars.MAIL_FROM }}
+          # Projects' own SMTP passwords: every secret named SMTP_PASSWORD_<PROJECT KEY>.
+          ALL_SECRETS: ${{ toJSON(secrets) }}
         run: |
           # k8s.yaml starts with the Namespace, so apply creates it before the Secret below.
           {
@@ -75,6 +77,14 @@ jobs:
               --from-literal=SMTP_USERNAME="$SMTP_USERNAME" \
               --from-literal=SMTP_PASSWORD="$SMTP_PASSWORD" \
               --from-literal=MAIL_FROM="$MAIL_FROM"
+            echo '---'
+            python3 - <<'PY'
+          import json, os, subprocess
+          secrets = json.loads(os.environ["ALL_SECRETS"])
+          literals = [f"--from-literal={k}={v}" for k, v in sorted(secrets.items()) if k.startswith("SMTP_PASSWORD_") and v]
+          print(subprocess.run(["kubectl", "create", "secret", "generic", "pmo-project-mail", "--namespace", "pmo",
+                                "--dry-run=client", "-o", "yaml", *literals], check=True, capture_output=True, text=True).stdout)
+          PY
           } > rendered.yaml
 
       - name: Deploy to k3s

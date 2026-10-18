@@ -72,6 +72,7 @@ fn api_router() -> OpenApiRouter<AppState> {
         .routes(routes!(me::revoke_key))
         .routes(routes!(projects::list, projects::create))
         .routes(routes!(projects::get, projects::update))
+        .routes(routes!(projects::get_notifications, projects::set_notifications))
         .routes(routes!(milestones::list, milestones::create))
         .routes(routes!(milestones::get, milestones::update, milestones::delete))
         .routes(routes!(issues::list, issues::create))
@@ -109,7 +110,7 @@ pub fn openapi(public_url: Option<&str>) -> utoipa::openapi::OpenApi {
         .content("application/json", Content::new(Some(Ref::from_schema_name("ErrorBody"))))
         .build();
     for item in doc.paths.paths.values_mut() {
-        let operations = [&mut item.get, &mut item.post, &mut item.patch, &mut item.delete];
+        let operations = [&mut item.get, &mut item.post, &mut item.put, &mut item.patch, &mut item.delete];
         for operation in operations.into_iter().flatten() {
             operation.responses.responses.entry("401".to_owned()).or_insert_with(|| unauthorized.clone().into());
             operation.responses.responses.entry("429".to_owned()).or_insert_with(|| rate_limited.clone().into());

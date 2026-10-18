@@ -5,6 +5,7 @@ pub mod events;
 pub mod extract;
 pub mod mail;
 pub mod models;
+pub mod notify;
 pub mod ratelimit;
 pub mod routes;
 pub mod storage;
