@@ -998,3 +998,47 @@ async fn project_notifications(db: PgPool) {
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert!(body["message"].as_str().unwrap().contains("MAIL_ENCRYPTION_KEY"));
 }
+
+#[sqlx::test]
+async fn lists_default_to_the_open_milestone(db: PgPool) {
+    let app = TestApp::new(db);
+    let (admin, app_key) = app.setup().await;
+    let report = |title: &str| json!({ "type": "bug", "title": title, "reporter": { "email": "ola@example.com" } });
+
+    // Without an open milestone, lists show everything.
+    app.post("/v1/projects/DM/issues", &app_key, report("before")).await;
+    let (_, page) = app.get("/v1/projects/DM/issues", &app_key).await;
+    assert_eq!(keys(&page), ["DM-1"]);
+
+    let (_, beta) = app.post("/v1/projects/DM/milestones", &admin, json!({ "name": "Beta" })).await;
+    let beta_id = beta["id"].as_str().unwrap().to_owned();
+    app.post("/v1/projects/DM/issues", &app_key, report("in beta")).await;
+    app.post("/v1/projects/DM/issues", &app_key, report("also beta")).await;
+    app.patch(&format!("/v1/milestones/{beta_id}"), &admin, json!({ "state": "closed" })).await;
+    let (_, gamma) = app.post("/v1/projects/DM/milestones", &admin, json!({ "name": "Gamma" })).await;
+    let gamma_id = gamma["id"].as_str().unwrap().to_owned();
+    app.post("/v1/projects/DM/issues", &app_key, report("in gamma")).await;
+
+    // By default: only the open milestone's issues.
+    let (_, page) = app.get("/v1/projects/DM/issues", &app_key).await;
+    assert_eq!(keys(&page), ["DM-4"]);
+    for (query, expected) in [
+        ("milestone=current", vec!["DM-4"]),
+        ("milestone=all", vec!["DM-4", "DM-3", "DM-2", "DM-1"]),
+        ("milestone=none", vec!["DM-1"]),
+        (&format!("milestone={beta_id}") as &str, vec!["DM-3", "DM-2"]),
+        (&format!("milestone_id={gamma_id}"), vec!["DM-4"]),
+        ("milestone=all&q=also", vec!["DM-3"]),
+    ] {
+        let (s, page) = app.get(&format!("/v1/projects/DM/issues?{query}"), &app_key).await;
+        assert_eq!(s, StatusCode::OK, "{query}");
+        assert_eq!(keys(&page), expected, "{query}");
+    }
+    let (s, _) = app.get("/v1/projects/DM/issues?milestone=latest", &app_key).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // Closing it shows everything again.
+    app.patch(&format!("/v1/milestones/{gamma_id}"), &admin, json!({ "state": "closed" })).await;
+    let (_, page) = app.get("/v1/projects/DM/issues", &app_key).await;
+    assert_eq!(keys(&page).len(), 4);
+}

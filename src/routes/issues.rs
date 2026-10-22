@@ -223,6 +223,11 @@ pub struct ListIssues {
     pub issue_type: Option<IssueType>,
     /// Comma-separated priorities, e.g. `P1,P2`.
     pub priority: Option<String>,
+    /// Which milestone's issues: `current` (the default: the project's open milestone, or all issues when none is
+    /// open), `all`, `none` (issues without a milestone) or a milestone's id.
+    #[param(example = "all")]
+    pub milestone: Option<String>,
+    /// Same as `milestone` with an id.
     pub milestone_id: Option<Uuid>,
     pub reporter_id: Option<Uuid>,
     pub platform: Option<String>,
@@ -235,6 +240,12 @@ pub struct ListIssues {
     /// 1 to 200, default 50.
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+}
+
+enum MilestoneFilter {
+    All,
+    None,
+    Id(Uuid),
 }
 
 fn parse_statuses(s: &str) -> ApiResult<Vec<&'static str>> {
@@ -269,7 +280,8 @@ fn parse_priorities(s: &str) -> ApiResult<Vec<String>> {
 
 /// List or search a project's issues.
 ///
-/// Private issues are included only for admins and their reporter.
+/// By default only the issues of the project's open milestone (all issues when none is open); `milestone=all` lists
+/// every issue. Private issues are included only for admins and their reporter.
 #[utoipa::path(
     get, operation_id = "listIssues", path = "/v1/projects/{key}/issues", tag = "issues", params(("key" = String, Path), ListIssues),
     responses((status = 200, body = Page<Issue>), (status = 404, body = ErrorBody))
@@ -295,8 +307,26 @@ pub async fn list(
     if let Some(priority) = &query.priority {
         qb.push(" AND i.priority::text = ANY(").push_bind(parse_priorities(priority)?).push(")");
     }
-    if let Some(milestone_id) = query.milestone_id {
-        qb.push(" AND i.milestone_id = ").push_bind(milestone_id);
+    let milestone = match (query.milestone_id, query.milestone.as_deref().map(str::trim)) {
+        (Some(id), _) => MilestoneFilter::Id(id),
+        (None, None | Some("") | Some("current")) => match milestones::open_in(&state.db, project.id).await? {
+            Some((id, _)) => MilestoneFilter::Id(id),
+            None => MilestoneFilter::All,
+        },
+        (None, Some("all")) => MilestoneFilter::All,
+        (None, Some("none")) => MilestoneFilter::None,
+        (None, Some(other)) => MilestoneFilter::Id(other.parse().map_err(|_| {
+            ApiError::bad_request(format!("milestone must be current, all, none or a milestone id, not {other:?}"))
+        })?),
+    };
+    match milestone {
+        MilestoneFilter::All => {}
+        MilestoneFilter::None => {
+            qb.push(" AND i.milestone_id IS NULL");
+        }
+        MilestoneFilter::Id(id) => {
+            qb.push(" AND i.milestone_id = ").push_bind(id);
+        }
     }
     if let Some(platform) = &query.platform {
         qb.push(" AND i.platform = ").push_bind(platform.trim().to_lowercase());

@@ -48,8 +48,9 @@ only to admins and the reporter themselves.
 | `GET /v1/issues/{key}/events` · `GET /v1/events` | An issue's history; the whole log (admin, filterable by project, issue, action, actor, time) |
 | `/v1/users…` · `/v1/apps…` | Admin only: users, apps and their keys |
 
-Listing issues takes `status` (comma-separated, or `open` / `closed`), `type`, `priority`, `platform`,
-`milestone_id`, `reporter_id`, `q` (search, sorted by relevance), `sort` (`newest`, `oldest`, `priority`, `updated`), `limit` and
+Listing issues shows **the open milestone's issues by default** (all issues when no milestone is open); `milestone`
+takes `current` (the default), `all`, `none` or a milestone id. It also takes `status` (comma-separated, or `open` /
+`closed`), `type`, `priority`, `platform`, `reporter_id`, `q` (search, sorted by relevance), `sort` (`newest`, `oldest`, `priority`, `updated`), `limit` and
 `offset`. Errors are always `{"error": "not_found", "message": "…"}`.
 
 ## Quick start
