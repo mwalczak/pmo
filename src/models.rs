@@ -97,6 +97,9 @@ impl IssueStatus {
 #[sqlx(type_name = "milestone_state", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum MilestoneState {
+    /// Not started yet: issues can be planned into it.
+    Planned,
+    /// The current one, which new issues go into. At most one per project.
     Open,
     Closed,
 }

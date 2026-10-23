@@ -78,7 +78,7 @@ pub struct CreateMilestone {
     pub name: String,
     pub description: Option<String>,
     pub due_on: Option<NaiveDate>,
-    /// Default `open`. A project has at most one open milestone: close the current one first.
+    /// Default `open`, or `planned` while another milestone is open (a project has at most one open milestone).
     pub state: Option<MilestoneState>,
 }
 
@@ -115,10 +115,15 @@ pub async fn create(
     principal.require_admin()?;
     let project = projects::load(&state, &principal, &key).await?;
     let name = non_blank(Some(body.name)).ok_or_else(|| ApiError::bad_request("name is required"))?;
-    let milestone_state = body.state.unwrap_or(MilestoneState::Open);
-    if milestone_state == MilestoneState::Open {
-        ensure_none_open(&state, project.id, None).await?;
-    }
+    let milestone_state = match body.state {
+        Some(MilestoneState::Open) => {
+            ensure_none_open(&state, project.id, None).await?;
+            MilestoneState::Open
+        }
+        Some(other) => other,
+        None if open_in(&state.db, project.id).await?.is_some() => MilestoneState::Planned,
+        None => MilestoneState::Open,
+    };
     let id = Uuid::now_v7();
     let description = non_blank(body.description);
     let mut tx = state.db.begin().await?;
