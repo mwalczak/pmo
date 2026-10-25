@@ -858,6 +858,56 @@ async fn planned_milestones(db: PgPool) {
 }
 
 #[sqlx::test]
+async fn assignees(db: PgPool) {
+    let app = TestApp::new(db);
+    let (admin, app_key) = app.setup().await;
+    let (_, dev) =
+        app.post("/v1/users", &admin, json!({ "email": "dev@example.com", "name": "Dev", "role": "admin" })).await;
+    let dev_key = mailed_key(&app.take_mails()[0]);
+    let dev_id = dev["id"].as_str().unwrap().to_owned();
+
+    // Admins assign at creation or later; nobody else can.
+    let todo = json!({ "type": "todo", "title": "Ship it", "assignee_id": dev_id });
+    let (s, issue) = app.post("/v1/projects/DM/issues", &admin, todo).await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert_eq!(issue["assignee"], json!({ "id": dev_id, "name": "Dev", "email": "dev@example.com" }));
+    let report =
+        json!({ "type": "bug", "title": "x", "reporter": { "email": "ola@example.com" }, "assignee_id": dev_id });
+    let (s, _) = app.post("/v1/projects/DM/issues", &app_key, report).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let report = json!({ "type": "bug", "title": "x", "reporter": { "email": "ola@example.com" } });
+    let (_, bug) = app.post("/v1/projects/DM/issues", &app_key, report).await;
+    assert_eq!(bug["assignee"], Value::Null);
+    let ola_key = mailed_key(&app.take_mails()[0]);
+    let (s, _) = app.patch("/v1/issues/DM-2", &ola_key, json!({ "assignee_id": dev_id })).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = app.patch("/v1/issues/DM-2", &admin, json!({ "assignee_id": Uuid::now_v7() })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (_, bug) = app.patch("/v1/issues/DM-2", &admin, json!({ "assignee_id": dev_id })).await;
+    assert_eq!(bug["assignee"]["name"], "Dev");
+    // Others see who, without the e-mail.
+    let (_, seen) = app.get("/v1/issues/DM-2", &ola_key).await;
+    assert_eq!(seen["assignee"], json!({ "id": dev_id, "name": "Dev" }));
+
+    let (_, page) = app.get("/v1/projects/DM/issues?assignee=me", &dev_key).await;
+    assert_eq!(keys(&page), vec!["DM-2", "DM-1"]);
+    app.patch("/v1/issues/DM-1", &admin, json!({ "assignee_id": null })).await;
+    let (_, page) = app.get(&format!("/v1/projects/DM/issues?assignee={dev_id}"), &app_key).await;
+    assert_eq!(keys(&page), vec!["DM-2"]);
+    let (_, page) = app.get("/v1/projects/DM/issues?assignee=none", &app_key).await;
+    assert_eq!(keys(&page), vec!["DM-1"]);
+    let (s, _) = app.get("/v1/projects/DM/issues?assignee=me", &app_key).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (_, log) = app.get("/v1/events?action=issue.updated", &admin).await;
+    assert_eq!(log["items"][0]["changes"]["assignee_id"], json!({ "from": dev_id, "to": null }));
+
+    // Deleting the user unassigns their issues.
+    app.call(Method::DELETE, &format!("/v1/users/{dev_id}"), Some(&admin), None).await;
+    let (_, bug) = app.get("/v1/issues/DM-2", &admin).await;
+    assert_eq!(bug["assignee"], Value::Null);
+}
+
+#[sqlx::test]
 async fn comments(db: PgPool) {
     let app = TestApp::new(db);
     let (admin, app_key) = app.setup().await;

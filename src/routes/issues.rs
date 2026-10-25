@@ -39,6 +39,8 @@ pub struct Issue {
     /// One of the project's platforms, e.g. `web`.
     pub platform: Option<String>,
     pub reporter: Reporter,
+    /// The user working on it.
+    pub assignee: Option<Assignee>,
     pub milestone: Option<MilestoneRef>,
     /// Key of the issue this one duplicates, when `status` is `duplicate`.
     pub duplicate_of: Option<String>,
@@ -55,6 +57,15 @@ pub struct Reporter {
     pub id: Uuid,
     pub name: Option<String>,
     /// Shown only to admins and the reporter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct Assignee {
+    pub id: Uuid,
+    pub name: Option<String>,
+    /// Shown only to admins and the assignee.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
 }
@@ -82,6 +93,9 @@ pub(super) struct IssueRow {
     pub(super) reporter_id: Uuid,
     reporter_name: Option<String>,
     reporter_email: String,
+    assignee_id: Option<Uuid>,
+    assignee_name: Option<String>,
+    assignee_email: Option<String>,
     milestone_id: Option<Uuid>,
     milestone_name: Option<String>,
     duplicate_of_id: Option<Uuid>,
@@ -109,7 +123,8 @@ impl IssueRow {
     }
 
     fn into_issue(self, principal: &Principal) -> Issue {
-        let sees_email = principal.is_admin() || principal.user().is_some_and(|u| u.id == self.reporter_id);
+        let is_user = |id: Uuid| principal.is_admin() || principal.user().is_some_and(|u| u.id == id);
+        let sees_email = is_user(self.reporter_id);
         Issue {
             id: self.id,
             key: format!("{}-{}", self.project, self.number),
@@ -127,6 +142,11 @@ impl IssueRow {
                 name: self.reporter_name,
                 email: sees_email.then_some(self.reporter_email),
             },
+            assignee: self.assignee_id.map(|id| Assignee {
+                id,
+                name: self.assignee_name,
+                email: self.assignee_email.filter(|_| is_user(id)),
+            }),
             milestone: self.milestone_id.zip(self.milestone_name).map(|(id, name)| MilestoneRef { id, name }),
             duplicate_of: self.duplicate_of,
             source_app: self.source_app,
@@ -139,12 +159,13 @@ impl IssueRow {
 
 const SELECT: &str = "SELECT i.id, i.project_id, p.key AS project, i.number, i.type AS issue_type, i.priority,
     i.status, i.title, i.description, i.private, i.platform, p.platforms AS project_platforms, i.reporter_id, u.name AS reporter_name, u.email AS reporter_email,
-    i.milestone_id, m.name AS milestone_name, i.duplicate_of_id, dp.key || '-' || d.number AS duplicate_of,
+    i.assignee_id, au.name AS assignee_name, au.email AS assignee_email, i.milestone_id, m.name AS milestone_name, i.duplicate_of_id, dp.key || '-' || d.number AS duplicate_of,
     a.name AS source_app, i.source_app_id, i.created_at, i.updated_at,
     (SELECT count(*) FROM issue_comments c WHERE c.issue_id = i.id AND NOT c.internal) AS comment_count
     FROM issues i
     JOIN projects p ON p.id = i.project_id
     JOIN users u ON u.id = i.reporter_id
+    LEFT JOIN users au ON au.id = i.assignee_id
     LEFT JOIN milestones m ON m.id = i.milestone_id
     LEFT JOIN issues d ON d.id = i.duplicate_of_id
     LEFT JOIN projects dp ON dp.id = d.project_id
@@ -230,6 +251,9 @@ pub struct ListIssues {
     /// Same as `milestone` with an id.
     pub milestone_id: Option<Uuid>,
     pub reporter_id: Option<Uuid>,
+    /// `me` (the calling user), `none` (unassigned) or a user's id.
+    #[param(example = "me")]
+    pub assignee: Option<String>,
     pub platform: Option<String>,
     /// Search in titles and descriptions, tolerant of typos. Results are sorted by relevance unless `sort` is given.
     /// Use it to look for an existing report before filing a new one.
@@ -334,6 +358,22 @@ pub async fn list(
     if let Some(reporter_id) = query.reporter_id {
         qb.push(" AND i.reporter_id = ").push_bind(reporter_id);
     }
+    match query.assignee.as_deref().map(str::trim) {
+        None | Some("") => {}
+        Some("none") => {
+            qb.push(" AND i.assignee_id IS NULL");
+        }
+        Some("me") => {
+            let user = principal.user().ok_or_else(|| ApiError::bad_request("assignee=me needs a user key"))?;
+            qb.push(" AND i.assignee_id = ").push_bind(user.id);
+        }
+        Some(other) => {
+            let id: Uuid = other
+                .parse()
+                .map_err(|_| ApiError::bad_request(format!("assignee must be me, none or a user id, not {other:?}")))?;
+            qb.push(" AND i.assignee_id = ").push_bind(id);
+        }
+    }
     let q = non_blank(query.q);
     if let Some(q) = &q {
         qb.push(" AND (strpos(lower(i.title), lower(").push_bind(q.clone());
@@ -381,6 +421,8 @@ pub struct CreateIssue {
     pub priority: Option<Priority>,
     /// Admins only. Default: the project's open milestone, if any.
     pub milestone_id: Option<Uuid>,
+    /// Admins only. Any user (see GET /v1/users).
+    pub assignee_id: Option<Uuid>,
     /// Default `false`; abuse reports are always created private.
     pub private: Option<bool>,
     /// One of the project's platforms (their ids, see `platforms` in GET /v1/projects/{key}).
@@ -389,6 +431,13 @@ pub struct CreateIssue {
     /// Who reported the issue. Required for apps, optional for admins; users report as themselves.
     /// An e-mail without an account gets one, and a key is e-mailed to it.
     pub reporter: Option<NewReporter>,
+}
+
+/// Assignees are existing users.
+async fn ensure_user(state: &AppState, id: Uuid) -> ApiResult<()> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)").bind(id).fetch_one(&state.db).await?;
+    if exists { Ok(()) } else { Err(ApiError::bad_request("assignee_id is not a user")) }
 }
 
 /// Checks that the platform is one of the project's (by id).
@@ -440,8 +489,11 @@ pub async fn create(
             project.key
         )));
     }
-    if !principal.is_admin() && (body.priority.is_some() || body.milestone_id.is_some()) {
-        return Err(ApiError::forbidden("only admins can set priority and milestone"));
+    if !principal.is_admin() && (body.priority.is_some() || body.milestone_id.is_some() || body.assignee_id.is_some()) {
+        return Err(ApiError::forbidden("only admins can set priority, milestone and assignee"));
+    }
+    if let Some(assignee_id) = body.assignee_id {
+        ensure_user(&state, assignee_id).await?;
     }
     if let Some(milestone_id) = body.milestone_id {
         let milestone = milestones::load(&state, &principal, milestone_id).await?;
@@ -478,8 +530,8 @@ pub async fn create(
     let id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO issues (id, project_id, number, type, priority, title, description, private, reporter_id,
-                             milestone_id, source_app_id, platform)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                             milestone_id, source_app_id, platform, assignee_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
     )
     .bind(id)
     .bind(project.id)
@@ -493,6 +545,7 @@ pub async fn create(
     .bind(milestone_id)
     .bind(principal.app_id())
     .bind(platform)
+    .bind(body.assignee_id)
     .execute(&mut *tx)
     .await?;
     let created = fetch_by_id(&mut *tx, id).await?;
@@ -508,6 +561,7 @@ pub async fn create(
             "private": created.private,
             "platform": created.platform,
             "milestone_id": created.milestone_id,
+            "assignee_id": created.assignee_id,
             "reporter": { "id": created.reporter_id, "name": created.reporter_name },
         }))
         .record(&mut *tx, (&principal).into())
@@ -557,6 +611,10 @@ pub struct UpdateIssue {
     #[serde(default, deserialize_with = "double_option")]
     #[schema(value_type = Option<Uuid>)]
     pub milestone_id: Option<Option<Uuid>>,
+    /// A user's id; `null` unassigns it.
+    #[serde(default, deserialize_with = "double_option")]
+    #[schema(value_type = Option<Uuid>)]
+    pub assignee_id: Option<Option<Uuid>>,
     /// Key of the original issue in the same project. Implies `status: duplicate`.
     #[serde(default, deserialize_with = "double_option")]
     #[schema(value_type = Option<String>, example = "DM-3")]
@@ -589,6 +647,7 @@ pub async fn update(
         || body.status.is_some()
         || body.private.is_some()
         || body.milestone_id.is_some()
+        || body.assignee_id.is_some()
         || body.duplicate_of.is_some();
     if !principal.is_admin() && (!is_reporter || triage) {
         return Err(ApiError::forbidden(
@@ -612,6 +671,9 @@ pub async fn update(
         if milestone.project_id != current.project_id {
             return Err(ApiError::bad_request("milestone belongs to another project"));
         }
+    }
+    if let Some(Some(assignee_id)) = body.assignee_id {
+        ensure_user(&state, assignee_id).await?;
     }
     let duplicate_of_id = match &body.duplicate_of {
         Some(Some(original)) => {
@@ -646,7 +708,7 @@ pub async fn update(
     let mut tx = state.db.begin().await?;
     sqlx::query(
         "UPDATE issues SET title = $2, description = $3, type = $4, priority = $5, status = $6, private = $7,
-                milestone_id = $8, duplicate_of_id = $9, platform = $10, updated_at = now()
+                milestone_id = $8, duplicate_of_id = $9, platform = $10, assignee_id = $11, updated_at = now()
          WHERE id = $1",
     )
     .bind(current.id)
@@ -659,6 +721,7 @@ pub async fn update(
     .bind(body.milestone_id.unwrap_or(current.milestone_id))
     .bind(duplicate_of_id)
     .bind(platform)
+    .bind(body.assignee_id.unwrap_or(current.assignee_id))
     .execute(&mut *tx)
     .await?;
 
@@ -672,6 +735,7 @@ pub async fn update(
         .field("private", &current.private, &updated.private)
         .field("platform", &current.platform, &updated.platform)
         .field("milestone_id", &current.milestone_id, &updated.milestone_id)
+        .field("assignee_id", &current.assignee_id, &updated.assignee_id)
         .field("duplicate_of", &current.duplicate_of, &updated.duplicate_of);
     if !diff.is_empty() {
         Event::new("issue.updated", "issue", current.id)
