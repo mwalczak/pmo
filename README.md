@@ -122,6 +122,11 @@ over SSH (namespace `pmo`: Postgres StatefulSet, API Deployment with a 10 Gi att
 with a cert-manager certificate). The attachments volume is ReadWriteOnce, so deploys use the `Recreate` strategy:
 a few seconds of downtime. Back up both the Postgres volume and the attachments volume.
 
+Every Monday at 03:37 UTC the workflow also rebuilds `main` from scratch (newest base images, Alpine packages and
+Rust toolchain, no layer cache) and deploys it, so security fixes land without a code change. Images are tagged
+`<commit>-<run number>`, so each rebuild is pulled. GitHub pauses scheduled workflows after 60 days without commits;
+re-enable it under Actions. Run **Build and deploy** by hand to rebuild at any time.
+
 Repository settings → Secrets and variables → Actions:
 
 | Secret | |

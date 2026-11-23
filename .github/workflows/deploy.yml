@@ -6,6 +6,9 @@ on:
     branches: [main]
     types: [completed]
   workflow_dispatch:
+  # Weekly rebuild of main, so the image picks up fixes in the base images and the Rust toolchain.
+  schedule:
+    - cron: '37 3 * * 1'
 
 permissions:
   contents: read
@@ -16,10 +19,12 @@ env:
 
 jobs:
   deploy:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     env:
       SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      # A rebuild of the same commit gets a new tag, so the node pulls it instead of reusing its cached image.
+      TAG: ${{ github.event.workflow_run.head_sha || github.sha }}-${{ github.run_number }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,10 +44,14 @@ jobs:
         with:
           context: .
           push: true
+          # Always the newest base images; the weekly rebuild also skips the layer cache.
+          pull: true
+          no-cache: ${{ github.event_name == 'schedule' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           tags: |
+            ${{ env.IMAGE }}:${{ env.TAG }}
             ${{ env.IMAGE }}:${{ env.SHA }}
             ${{ env.IMAGE }}:latest
 
@@ -66,7 +75,7 @@ jobs:
         run: |
           # k8s.yaml starts with the Namespace, so apply creates it before the Secret below.
           {
-            sed -e "s|IMAGE_PLACEHOLDER|${IMAGE}:${SHA}|" -e "s|DEPLOY_ID_PLACEHOLDER|\"${SHA}-${GITHUB_RUN_ID}\"|" \
+            sed -e "s|IMAGE_PLACEHOLDER|${IMAGE}:${TAG}|" -e "s|DEPLOY_ID_PLACEHOLDER|\"${SHA}-${GITHUB_RUN_ID}\"|" \
                 -e "s|HOST_PLACEHOLDER|${API_HOST}|g" k8s.yaml
             echo '---'
             kubectl create secret generic pmo --namespace pmo --dry-run=client -o yaml \

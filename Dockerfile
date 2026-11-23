@@ -1,5 +1,6 @@
 FROM rust:1-alpine AS build
-RUN apk add --no-cache musl-dev gcc
+# Upgrade first: musl is linked into the binary, so its fixes ship with each rebuild.
+RUN apk upgrade --no-cache && apk add --no-cache musl-dev gcc
 WORKDIR /app
 # Build dependencies first, so they stay cached while only the code changes.
 COPY Cargo.toml Cargo.lock build.rs ./
